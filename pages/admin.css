@@ -100,6 +100,7 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 9px;
+  flex-wrap: wrap;
 }
 
 .header-status {
@@ -135,6 +136,12 @@ button:disabled {
   background: var(--red-soft);
   color: var(--red);
   border-color: #f2d0d0;
+}
+
+.status-pill.status-paused {
+  background: var(--amber-soft);
+  color: var(--amber);
+  border-color: #eedbb6;
 }
 
 .tabs {
@@ -205,7 +212,16 @@ button:disabled {
   padding: 7px 12px;
   font-weight: 600;
   line-height: 1;
+  white-space: nowrap;
+  flex: 0 0 auto;
   transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.button.compact {
+  min-height: 32px;
+  height: 32px;
+  padding: 5px 10px;
+  font-size: 12px;
 }
 
 .button.primary {
@@ -298,6 +314,24 @@ button:disabled {
   grid-template-columns: repeat(5, minmax(0, 1fr));
   align-items: start;
   margin-top: 18px;
+}
+
+.composer.editing .composer-grid {
+  grid-template-columns: 1fr;
+}
+
+.edit-node-lock {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border: 1px solid #f1d5bd;
+  border-radius: 7px;
+  background: var(--accent-soft);
+  color: #7a3c0d;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .field {
@@ -648,9 +682,10 @@ td {
   font-size: 13px;
 }
 
-td:nth-child(6),
-td:nth-child(7),
-td:nth-child(8) {
+.group-table > tbody > tr.group-row > td:nth-child(5),
+.group-table > tbody > tr.group-row > td:nth-child(6),
+.group-table > tbody > tr.group-row > td:nth-child(7),
+.group-table > tbody > tr.group-row > td:nth-child(8) {
   white-space: nowrap;
 }
 
@@ -703,6 +738,174 @@ tbody tr:hover {
   white-space: nowrap;
 }
 
+.group-table {
+  min-width: 900px;
+}
+
+.group-row {
+  cursor: pointer;
+}
+
+.group-row.expanded {
+  background: #fffaf5;
+}
+
+.group-domain-list {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.group-domain-list small {
+  color: var(--muted);
+  font-family: inherit;
+}
+
+.mode-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  background: var(--blue-soft);
+  color: var(--blue);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.expand-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.expand-button:hover {
+  background: var(--surface-muted);
+  color: var(--text);
+}
+
+.expand-button svg {
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.15s ease;
+}
+
+.expand-button.expanded svg {
+  transform: rotate(90deg);
+}
+
+.node-cell-inner {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.node-cell-name {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-row > td {
+  padding: 0;
+  background: #fbfcfd;
+}
+
+.group-detail {
+  padding: 15px 18px 18px;
+  border-top: 1px solid #f1f4f7;
+}
+
+.detail-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.detail-heading strong {
+  font-size: 13px;
+}
+
+.detail-heading span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.target-table {
+  min-width: 600px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  table-layout: fixed;
+}
+
+.target-table th,
+.target-table td {
+  padding: 8px 10px;
+  font-size: 12px;
+}
+
+.target-table td:nth-child(1),
+.target-table td:nth-child(2) {
+  white-space: nowrap;
+}
+
+.target-table th:nth-child(1) { width: 30%; }
+.target-table th:nth-child(2) { width: 10%; }
+.target-table th:nth-child(3) { width: 24%; }
+.target-table th:nth-child(4) { width: 16%; }
+.target-table th:nth-child(5) { width: 20%; }
+
+.target-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.target-table td:nth-child(4) {
+  white-space: normal;
+}
+
+.target-table .target-domain {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.target-table .target-error {
+  max-width: 280px;
+  color: var(--red);
+  font-size: 11px;
+}
+
+.detail-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
@@ -739,6 +942,11 @@ tbody tr:hover {
 }
 
 .badge.pending {
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.badge.running {
   color: var(--blue);
   background: var(--blue-soft);
 }
@@ -823,9 +1031,10 @@ tbody tr:hover {
 
 .settings-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 280px;
+  grid-template-columns: minmax(0, 820px) minmax(240px, 280px);
   gap: 22px;
   align-items: start;
+  justify-content: start;
 }
 
 .settings-main,
@@ -879,6 +1088,17 @@ tbody tr:hover {
   display: grid;
   grid-template-columns: minmax(200px, 260px) minmax(240px, 1fr);
   gap: 14px;
+  align-items: stretch;
+}
+
+.setting-toggle {
+  display: flex;
+  min-width: 0;
+}
+
+.setting-toggle .switch-row {
+  width: 100%;
+  min-height: 100%;
 }
 
 .settings-save {
@@ -959,6 +1179,10 @@ tbody tr:hover {
     grid-template-columns: 1fr;
   }
 
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+
   .settings-aside {
     position: static;
   }
@@ -976,6 +1200,7 @@ tbody tr:hover {
 @media (max-width: 640px) {
   .app-header {
     align-items: flex-start;
+    flex-wrap: wrap;
   }
 
   .brand h1 {
@@ -994,6 +1219,15 @@ tbody tr:hover {
 
   .node-list {
     grid-template-columns: 1fr;
+  }
+
+  .group-detail {
+    padding: 12px;
+  }
+
+  .detail-heading {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .composer-footer,

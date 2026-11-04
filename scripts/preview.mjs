@@ -16,6 +16,7 @@ const nodes = [
 let records = [
   {
     id: "record-preview-a",
+    groupId: "group-hk1",
     domain: "hk1.example.com",
     type: "A",
     nodeUuid: "hk1-node",
@@ -29,6 +30,7 @@ let records = [
   },
   {
     id: "record-preview-aaaa",
+    groupId: "group-hk1",
     domain: "hk1.example.com",
     type: "AAAA",
     nodeUuid: "hk1-node",
@@ -42,6 +44,7 @@ let records = [
   },
   {
     id: "record-preview-sg",
+    groupId: "group-sg1",
     domain: "sg1.example.com",
     type: "A",
     nodeUuid: "sg1-node",
@@ -54,6 +57,48 @@ let records = [
     updatedAt: new Date().toISOString(),
   },
 ];
+
+let groups = [
+  {
+    id: "group-hk1",
+    nodeUuid: "hk1-node",
+    domains: ["hk1.example.com"],
+    mode: "dual",
+    ttl: 1,
+    proxied: false,
+    enabled: true,
+    intervalMinutes: 1,
+    adoptExisting: false,
+    recordIds: ["record-preview-a", "record-preview-aaaa"],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    id: "group-sg1",
+    nodeUuid: "sg1-node",
+    domains: ["sg1.example.com"],
+    mode: "v4",
+    ttl: 300,
+    proxied: true,
+    enabled: true,
+    intervalMinutes: 5,
+    adoptExisting: false,
+    recordIds: ["record-preview-sg"],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+];
+
+let settings = {
+  authMode: "token",
+  email: "",
+  hasToken: true,
+  hasApiKey: false,
+  notify: true,
+  paused: false,
+  intervalMinutes: 1,
+  updatedAt: new Date().toISOString(),
+};
 
 const statuses = {
   "record-preview-a": {
@@ -149,20 +194,13 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname.startsWith("/ddns-plus/")) {
     if (req.method === "GET" && url.pathname === "/ddns-plus/state") {
       json(res, {
-        settings: {
-          authMode: "token",
-          email: "",
-          hasToken: true,
-          hasApiKey: false,
-          notify: true,
-          intervalMinutes: 1,
-          updatedAt: new Date().toISOString(),
-        },
+        settings,
         records,
+        groups,
         statuses,
         sync,
         csrf: "preview-csrf",
-        version: "0.0.1",
+        version: "0.0.2",
       });
       return;
     }
@@ -176,33 +214,59 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/ddns-plus/settings/test") {
       await new Promise((resolve) => setTimeout(resolve, 450));
-      json(res, { message: "API Token 验证成功，可读取 2 个有效 Zone。", zoneCount: 2 });
+      json(res, { message: "API Token 验证成功，可读取 2 个有效 Zone，并具备 DNS 记录读取权限。", zoneCount: 2 });
       return;
     }
     if (req.method === "POST" && url.pathname === "/ddns-plus/settings") {
+      settings = {
+        ...settings,
+        notify: true,
+        intervalMinutes: 1,
+        updatedAt: new Date().toISOString(),
+      };
       json(res, {
-        settings: {
-          authMode: "token",
-          email: "",
-          hasToken: true,
-          hasApiKey: false,
-          notify: true,
-          intervalMinutes: 1,
-          updatedAt: new Date().toISOString(),
-        },
+        settings,
       });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/ddns-plus/pause") {
+      const body = await readBody(req);
+      settings = { ...settings, paused: Boolean(body.paused) };
+      json(res, { paused: settings.paused });
       return;
     }
     if (req.method === "POST" && url.pathname === "/ddns-plus/records/batch") {
       const body = await readBody(req);
       const count = String(body.domains || "").split(/[\s,;]+/).filter(Boolean).length;
-      json(res, { added: count, skipped: 0, total: records.length + count, records: [] });
+      json(res, { groupsAdded: Array.isArray(body.nodeUuids) ? body.nodeUuids.length : 1, recordsAdded: count, totalRecords: records.length + count, records: [] });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/ddns-plus/groups/update") {
+      const body = await readBody(req);
+      groups = groups.map((group) =>
+        group.id === body.groupId
+          ? {
+              ...group,
+              domains: String(body.domains || "")
+                .split(/[\s,;]+/)
+                .filter(Boolean),
+              mode: body.mode || group.mode,
+              ttl: Number(body.ttl) || group.ttl,
+              proxied: Boolean(body.proxied),
+              intervalMinutes: Number(body.intervalMinutes) || group.intervalMinutes,
+            }
+          : group,
+      );
+      json(res, { ok: true, removedTargets: 0 });
       return;
     }
     if (req.method === "POST" && url.pathname === "/ddns-plus/records/bulk") {
       const body = await readBody(req);
-      if (body.action === "delete") records = records.filter((record) => !(body.ids || []).includes(record.id));
-      json(res, { ok: true, affected: (body.ids || []).length });
+      if (body.action === "delete") {
+        records = records.filter((record) => !(body.ids || []).includes(record.groupId));
+        groups = groups.filter((group) => !(body.ids || []).includes(group.id));
+      }
+      json(res, { ok: true, affectedGroups: (body.ids || []).length });
       return;
     }
     if (req.method === "POST" && url.pathname === "/ddns-plus/sync") {

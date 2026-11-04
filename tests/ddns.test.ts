@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CloudflareClient } from "../src/cloudflare";
 import { SyncEngine } from "../src/ddns";
 import { Storage } from "../src/storage";
-import { CloudflareRecord, DdnsRecord, Settings } from "../src/types";
+import { CloudflareRecord, DdnsRecord, NotificationPayload, Settings } from "../src/types";
 import { recordMarker } from "../src/util";
 
 const dirs: string[] = [];
@@ -30,6 +30,7 @@ function settings(authMode: "token" | "key" = "token"): Settings {
     email: authMode === "key" ? "admin@example.com" : "",
     apiKey: authMode === "key" ? "k".repeat(37) : "",
     notify: false,
+    paused: false,
     intervalMinutes: 1,
     updatedAt: "",
   };
@@ -38,6 +39,7 @@ function settings(authMode: "token" | "key" = "token"): Settings {
 function rule(overrides: Partial<DdnsRecord> = {}): DdnsRecord {
   return {
     id: "record-0001",
+    groupId: "group-0001",
     domain: "home.example.com",
     type: "A",
     nodeUuid: "node-0001",
@@ -96,7 +98,7 @@ describe("SyncEngine", () => {
     storage.saveSettings(settings());
     storage.saveRecords([rule()]);
     const mock = mockClient();
-    const notify = vi.fn(async () => undefined);
+    const notify = vi.fn(async (_payload: NotificationPayload) => undefined);
     const engine = new SyncEngine({
       storage,
       getNodes: async () => [
@@ -221,5 +223,131 @@ describe("SyncEngine", () => {
     expect(mock.update).not.toHaveBeenCalled();
     expect(engine.snapshot().statuses["record-0001"].state).toBe("skipped");
     expect(engine.snapshot().job.skipped).toBe(1);
+  });
+
+  it("sends one detailed notification for IP changes", async () => {
+    const storage = makeStorage();
+    const current = settings();
+    current.notify = true;
+    storage.saveSettings(current);
+    storage.saveRecords([rule()]);
+    const mock = mockClient();
+    const notify = vi.fn(async (_payload: NotificationPayload) => undefined);
+    const engine = new SyncEngine({
+      storage,
+      getNodes: async () => [
+        {
+          uuid: "node-0001",
+          name: "HK1",
+          ipv4: "8.8.8.8",
+          ipv6: "",
+          online: true,
+          group: "",
+        },
+      ],
+      notify,
+      createClient: () => mock.client,
+    });
+    engine.start();
+    await waitForIdle(engine);
+    expect(notify).toHaveBeenCalledTimes(1);
+    const payload = notify.mock.calls[0][0];
+    expect(payload.clients).toEqual(["node-0001"]);
+    expect(payload.message).toContain("HK1 / home.example.com A");
+    expect(payload.message).toContain("新建 -> 8.8.8.8");
+  });
+
+  it("does not repeat the same failure notification", async () => {
+    const storage = makeStorage();
+    const current = settings();
+    current.notify = true;
+    storage.saveSettings(current);
+    storage.saveRecords([rule()]);
+    const mock = mockClient();
+    mock.client.listRecords = async () => {
+      throw new Error("DNS permission denied");
+    };
+    const notify = vi.fn(async (_payload: NotificationPayload) => undefined);
+    const engine = new SyncEngine({
+      storage,
+      getNodes: async () => [
+        {
+          uuid: "node-0001",
+          name: "HK1",
+          ipv4: "8.8.8.8",
+          ipv6: "",
+          online: true,
+          group: "",
+        },
+      ],
+      notify,
+      createClient: () => mock.client,
+    });
+    engine.start();
+    await waitForIdle(engine);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].message).toContain("同步失败 1 条");
+    expect(notify.mock.calls[0][0].message).toContain("home.example.com A");
+    engine.start();
+    await waitForIdle(engine);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not notify for TTL-only updates when the IP is unchanged", async () => {
+    const storage = makeStorage();
+    const current = settings();
+    current.notify = true;
+    storage.saveSettings(current);
+    storage.saveRecords([rule({ ttl: 60 })]);
+    const mock = mockClient([
+      {
+        id: "existing",
+        type: "A",
+        name: "home.example.com",
+        content: "8.8.8.8",
+        ttl: 300,
+        proxied: false,
+        comment: recordMarker("record-0001"),
+      },
+    ]);
+    const notify = vi.fn(async (_payload: NotificationPayload) => undefined);
+    const engine = new SyncEngine({
+      storage,
+      getNodes: async () => [
+        {
+          uuid: "node-0001",
+          name: "HK1",
+          ipv4: "8.8.8.8",
+          ipv6: "",
+          online: true,
+          group: "",
+        },
+      ],
+      notify,
+      createClient: () => mock.client,
+    });
+    engine.start();
+    await waitForIdle(engine);
+    expect(mock.update).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("does not run scheduled sync while paused", async () => {
+    const storage = makeStorage();
+    const current = settings();
+    current.paused = true;
+    storage.saveSettings(current);
+    storage.saveRecords([rule()]);
+    const mock = mockClient();
+    const engine = new SyncEngine({
+      storage,
+      getNodes: async () => [],
+      notify: async () => undefined,
+      createClient: () => mock.client,
+    });
+    const job = engine.startDue();
+    expect(job.running).toBe(false);
+    expect(job.message).toContain("暂停");
+    expect(mock.create).not.toHaveBeenCalled();
   });
 });

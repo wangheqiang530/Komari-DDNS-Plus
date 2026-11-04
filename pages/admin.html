@@ -18,6 +18,10 @@
         </div>
         <div class="header-status">
           <span id="sync-state" class="status-pill status-idle">待命</span>
+          <button id="btn-toggle-pause" class="button secondary compact" type="button">
+            <span data-icon="pause"></span>
+            <span id="pause-label">暂停同步</span>
+          </button>
           <button id="btn-refresh" class="icon-button" type="button" title="刷新">
             <span data-icon="refresh"></span>
           </button>
@@ -27,7 +31,7 @@
       <nav class="tabs" aria-label="DDNS Plus 页面">
         <button class="tab active" id="tab-records" type="button" data-panel="records">
           <span data-icon="list"></span>
-          DDNS 规则
+          节点规则
         </button>
         <button class="tab" id="tab-settings" type="button" data-panel="settings">
           <span data-icon="settings"></span>
@@ -45,7 +49,7 @@
             <div class="toolbar-actions">
               <button id="btn-add" class="button primary" type="button">
                 <span data-icon="plus"></span>
-                批量添加
+                新建节点规则
               </button>
               <button id="btn-sync-all" class="button secondary" type="button">
                 <span data-icon="play"></span>
@@ -58,16 +62,18 @@
           <section id="composer" class="composer" hidden>
             <div class="section-heading">
               <div>
-                <h2>批量添加规则</h2>
-                <p>选择节点、输入域名，生成独立的 A / AAAA 同步记录。</p>
+                <h2 id="composer-title">新建节点规则</h2>
+                <p id="composer-subtitle">每台节点生成一个独立规则组，可重复创建 IPv4 和 IPv6 规则。</p>
               </div>
               <button id="btn-cancel-add" class="icon-button" type="button" title="关闭">
                 <span data-icon="x"></span>
               </button>
             </div>
 
-            <div class="composer-grid">
-              <div class="field node-field">
+            <div id="edit-node-lock" class="edit-node-lock" hidden></div>
+
+            <div class="composer-grid" id="composer-grid">
+              <div class="field node-field" id="node-field">
                 <div class="field-label-row">
                   <label>选择节点</label>
                   <span class="node-actions">
@@ -156,14 +162,14 @@
                 <button id="btn-cancel-add-2" class="button secondary" type="button">取消</button>
                 <button id="btn-create-batch" class="button primary" type="button">
                   <span data-icon="plus"></span>
-                  创建规则
+                  <span id="btn-create-batch-label">创建规则</span>
                 </button>
               </div>
             </div>
           </section>
 
           <div id="bulk-bar" class="bulk-bar" hidden>
-            <span id="bulk-count">已选 0 条</span>
+            <span id="bulk-count">已选 0 个节点规则组</span>
             <div class="bulk-actions">
               <button id="btn-bulk-enable" class="button subtle" type="button">
                 <span data-icon="power"></span>
@@ -179,7 +185,7 @@
               </button>
               <button id="btn-bulk-delete" class="button danger" type="button">
                 <span data-icon="trash"></span>
-                删除规则
+                删除规则组
               </button>
             </div>
           </div>
@@ -187,7 +193,7 @@
           <div class="filter-bar">
             <div class="search-box table-search">
               <span data-icon="search"></span>
-              <input id="filter-search" type="search" placeholder="筛选域名或节点" autocomplete="off" />
+              <input id="filter-search" type="search" placeholder="筛选节点或域名" autocomplete="off" />
             </div>
             <select id="filter-status" aria-label="按状态筛选">
               <option value="">全部状态</option>
@@ -201,14 +207,13 @@
           </div>
 
           <div class="table-wrap">
-            <table>
+            <table class="group-table">
               <thead>
                 <tr>
                   <th class="check-cell"><input id="select-all" type="checkbox" aria-label="全选" /></th>
-                  <th>域名</th>
-                  <th>类型</th>
                   <th>节点</th>
-                  <th>当前 IP</th>
+                  <th>模式</th>
+                  <th>域名</th>
                   <th>TTL</th>
                   <th>代理</th>
                   <th>状态</th>
@@ -216,15 +221,15 @@
                   <th class="action-cell">操作</th>
                 </tr>
               </thead>
-              <tbody id="records-body"></tbody>
+              <tbody id="groups-body"></tbody>
             </table>
             <div id="empty-records" class="empty-state" hidden>
               <span data-icon="globe"></span>
-              <h3>还没有 DDNS 规则</h3>
-              <p>先配置 Cloudflare 凭据，然后批量添加域名。</p>
+              <h3>还没有节点规则</h3>
+              <p>先配置 Cloudflare 凭据，然后为节点创建规则组。</p>
               <button id="btn-empty-add" class="button primary" type="button">
                 <span data-icon="plus"></span>
-                批量添加
+                新建节点规则
               </button>
             </div>
           </div>
@@ -252,7 +257,7 @@
                 <div class="field">
                   <label for="token">API Token</label>
                   <input id="token" type="password" autocomplete="new-password" placeholder="粘贴 Cloudflare API Token" />
-                  <small id="token-hint">建议使用 Zone.Zone:Read 和 Zone.DNS:Edit 权限。</small>
+                  <small id="token-hint">支持用户 API Token 和 Account API Token。需要 Zone > Zone > Read 与 Zone > DNS > Edit。</small>
                 </div>
               </div>
 
@@ -295,11 +300,11 @@
                     <option value="60">每 60 分钟</option>
                   </select>
                 </div>
-                <div class="field switch-field">
+                <div class="setting-toggle">
                   <label class="switch-row">
                     <span>
-                      <b>发送同步通知</b>
-                      <small>使用 Komari 已配置的通知渠道</small>
+                      <b>发送变更通知</b>
+                      <small>仅 IP 变更或首次同步失败时通知</small>
                     </span>
                     <input id="notify" type="checkbox" />
                     <span class="switch"></span>
@@ -318,7 +323,7 @@
               <h3>安全提示</h3>
               <p>推荐使用 API Token。Global API Key 拥有账户级完整权限，只应在必要时使用。</p>
               <p>密钥保存后不会回显；留空保存会保留当前密钥。</p>
-              <p>测试连接只读取账户和 Zone 信息，不会写入 DNS。</p>
+              <p>测试连接只读取 Zone 和 DNS 记录权限，不会写入 DNS。</p>
             </aside>
           </div>
         </section>

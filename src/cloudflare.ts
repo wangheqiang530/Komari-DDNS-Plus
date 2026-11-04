@@ -268,17 +268,65 @@ export function createCloudflareClient(
   }
 
   async function test(): Promise<{ message: string; zoneCount: number }> {
-    if (auth.authMode === "token") {
-      await request<{ status: string }>("/user/tokens/verify");
-    } else {
+    if (auth.authMode === "key") {
       await request<{ id: string }>("/user");
     }
-    const zones = await listZones();
+    let zones: CloudflareZone[];
+    try {
+      zones = await listZones();
+    } catch (error) {
+      if (
+        auth.authMode === "token" &&
+        error instanceof CloudflareError &&
+        (error.status === 401 || error.status === 403)
+      ) {
+        throw new CloudflareError(
+          "API Token 无法读取 Zone。请授予 Zone > Zone > Read，并授权目标域名；Account API Token 也可以直接使用。",
+          error.status,
+          typeof error.code === "number" ? error.code : undefined,
+        );
+      }
+      throw error;
+    }
+
+    if (zones.length > 0) {
+      let dnsReadable = false;
+      let dnsError: CloudflareError | undefined;
+      for (const zone of zones) {
+        try {
+          await request<CloudflareRecord[]>(
+            `/zones/${encodeURIComponent(zone.id)}/dns_records?per_page=1`,
+          );
+          dnsReadable = true;
+          break;
+        } catch (error) {
+          if (
+            error instanceof CloudflareError &&
+            (error.status === 401 || error.status === 403)
+          ) {
+            dnsError = error;
+            continue;
+          }
+          throw error;
+        }
+      }
+      if (!dnsReadable && dnsError) {
+        throw new CloudflareError(
+          "API Token 可以读取 Zone，但缺少 DNS 记录读取权限。请授予 Zone > DNS > Edit，并授权目标域名。",
+          dnsError.status,
+          typeof dnsError.code === "number" ? dnsError.code : undefined,
+        );
+      }
+    }
+
+    const suffix = zones.length
+      ? `可读取 ${zones.length} 个有效 Zone，并具备 DNS 记录读取权限。`
+      : "但当前凭据未授权任何有效 Zone。";
     return {
       message:
         auth.authMode === "token"
-          ? `API Token 验证成功，可读取 ${zones.length} 个有效 Zone。`
-          : `Global API Key 验证成功，可读取 ${zones.length} 个有效 Zone。`,
+          ? `API Token 验证成功，${suffix}`
+          : `Global API Key 验证成功，${suffix}`,
       zoneCount: zones.length,
     };
   }

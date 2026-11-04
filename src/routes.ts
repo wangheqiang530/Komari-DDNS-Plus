@@ -3,14 +3,16 @@ import { jsonResponse } from "@komari-monitor/plugin-sdk";
 import { expandBatch } from "./batch";
 import { SyncEngine } from "./ddns";
 import { createCloudflareClient } from "./cloudflare";
+import { groupRecords, recordsForGroup } from "./groups";
 import { Storage } from "./storage";
-import { CreateMode, NodeInfo } from "./types";
+import { CreateMode, DdnsRecord, NodeInfo } from "./types";
 import {
   PluginError,
   assertRecordLimit,
   errorMessage,
   normalizeInterval,
   normalizeNodeIds,
+  normalizeRecord,
   normalizeSettings,
   normalizeTtl,
   nowIso,
@@ -107,15 +109,17 @@ export function registerRoutes(deps: RouteDependencies): void {
   server.route("GET", "/ddns-plus/state", (req, res) => {
     if (!requireAdmin(req, res)) return;
     const settings = storage.loadSettings();
+    const records = storage.loadRecords();
     const snapshot = engine.snapshot();
     setNoStore(res);
     jsonResponse(res, {
       settings: publicSettings(settings),
-      records: storage.loadRecords(),
+      records,
+      groups: groupRecords(records),
       statuses: snapshot.statuses,
       sync: snapshot.job,
       csrf,
-      version: "0.0.1",
+      version: "0.0.2",
     });
   });
 
@@ -163,6 +167,27 @@ export function registerRoutes(deps: RouteDependencies): void {
     }
   });
 
+  server.route("POST", "/ddns-plus/pause", (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    try {
+      requireCsrf(req, csrf);
+      const paused = parseBoolean(bodyOf(req).paused, false, "暂停开关");
+      const settings = storage.loadSettings();
+      settings.paused = paused;
+      settings.updatedAt = nowIso();
+      storage.saveSettings(settings);
+      storage.appendLog({
+        level: "info",
+        action: paused ? "pause" : "resume",
+        message: paused ? "已暂停计划同步。" : "已恢复计划同步。",
+      });
+      setNoStore(res);
+      jsonResponse(res, { paused });
+    } catch (error) {
+      fail(res, error);
+    }
+  });
+
   server.route("POST", "/ddns-plus/records/batch", async (req, res) => {
     if (!requireAdmin(req, res)) return;
     try {
@@ -202,27 +227,139 @@ export function registerRoutes(deps: RouteDependencies): void {
       const existing = new Set(
         records.map((record) => recordKey(record.domain, record.type, record.nodeUuid)),
       );
-      const additions = generated.filter((record) => {
+      const duplicates: string[] = [];
+      for (const record of generated) {
         const key = recordKey(record.domain, record.type, record.nodeUuid);
-        if (existing.has(key)) return false;
-        existing.add(key);
-        return true;
-      });
-      assertRecordLimit(records.length + additions.length);
-      if (additions.length) {
-        storage.saveRecords(records.concat(additions));
-        storage.appendLog({
-          level: "info",
-          action: "batch-add",
-          message: `批量添加 ${additions.length} 条规则，跳过 ${generated.length - additions.length} 条重复规则。`,
-        });
+        if (existing.has(key)) duplicates.push(`${record.domain} ${record.type}`);
       }
+      if (duplicates.length) {
+        throw new PluginError(
+          `以下目标已存在，不能重复创建：${duplicates.slice(0, 5).join("、")}${
+            duplicates.length > 5 ? ` 等 ${duplicates.length} 条` : ""
+          }。同一个节点可以创建不同模式或不同域名的规则组。`,
+          409,
+        );
+      }
+      assertRecordLimit(records.length + generated.length);
+      const groupsAdded = new Set(generated.map((record) => record.groupId)).size;
+      storage.saveRecords(records.concat(generated));
+      storage.appendLog({
+        level: "info",
+        action: "batch-add",
+        message: `新增 ${groupsAdded} 个节点规则组，共 ${generated.length} 条 DNS 目标。`,
+      });
       setNoStore(res);
       jsonResponse(res, {
-        added: additions.length,
-        skipped: generated.length - additions.length,
-        total: records.length + additions.length,
-        records: additions,
+        groupsAdded,
+        recordsAdded: generated.length,
+        totalRecords: records.length + generated.length,
+        groups: groupRecords(generated),
+        records: generated,
+      });
+    } catch (error) {
+      fail(res, error);
+    }
+  });
+
+  server.route("POST", "/ddns-plus/groups/update", (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    try {
+      requireCsrf(req, csrf);
+      ensureIdle(engine);
+      const body = bodyOf(req);
+      const groupId = String(body.groupId || "").trim();
+      if (!/^[a-zA-Z0-9-]{8,64}$/.test(groupId)) {
+        throw new PluginError("规则组 ID 无效。");
+      }
+      const records = storage.loadRecords();
+      const groupItems = recordsForGroup(records, groupId);
+      if (!groupItems.length) throw new PluginError("规则组不存在。", 404);
+      const first = groupItems[0];
+      const domains = parseDomains(body.domains);
+      const inferredMode = groupItems.some((item) => item.type === "AAAA")
+        ? groupItems.some((item) => item.type === "A")
+          ? "dual"
+          : "v6"
+        : "v4";
+      const mode = body.mode === undefined ? inferredMode : parseMode(body.mode);
+      const proxied = parseBoolean(body.proxied, first.proxied, "代理开关");
+      const ttl = normalizeTtl(body.ttl ?? first.ttl, proxied);
+      const intervalMinutes = normalizeInterval(
+        body.intervalMinutes ?? first.intervalMinutes,
+      );
+      const enabled = parseBoolean(body.enabled, first.enabled, "启用开关");
+      const adoptExisting = parseBoolean(
+        body.adoptExisting,
+        first.adoptExisting,
+        "接管已有记录开关",
+      );
+      const types: Array<"A" | "AAAA"> =
+        mode === "v4" ? ["A"] : mode === "v6" ? ["AAAA"] : ["A", "AAAA"];
+      const oldByKey = new Map(
+        groupItems.map((record) => [recordKey(record.domain, record.type, record.nodeUuid), record]),
+      );
+      const nextGroupRecords: DdnsRecord[] = [];
+      for (const domain of domains) {
+        for (const type of types) {
+          const key = recordKey(domain, type, first.nodeUuid);
+          const previous = oldByKey.get(key);
+          nextGroupRecords.push(
+            normalizeRecord(
+              {
+                ...previous,
+                groupId,
+                domain,
+                type,
+                nodeUuid: first.nodeUuid,
+                ttl,
+                proxied,
+                enabled,
+                intervalMinutes,
+                adoptExisting,
+              },
+              previous,
+            ),
+          );
+        }
+      }
+      const outsideKeys = new Set(
+        records
+          .filter((record) => record.groupId !== groupId)
+          .map((record) => recordKey(record.domain, record.type, record.nodeUuid)),
+      );
+      const overlaps = nextGroupRecords.filter((record) =>
+        outsideKeys.has(recordKey(record.domain, record.type, record.nodeUuid)),
+      );
+      if (overlaps.length) {
+        throw new PluginError(
+          `目标已被其他规则组占用：${overlaps
+            .slice(0, 5)
+            .map((record) => `${record.domain} ${record.type}`)
+            .join("、")}`,
+          409,
+        );
+      }
+      const nextIds = new Set(nextGroupRecords.map((record) => record.id));
+      const removedIds = groupItems
+        .filter((record) => !nextIds.has(record.id))
+        .map((record) => record.id);
+      const nextRecords = records
+        .filter((record) => record.groupId !== groupId)
+        .concat(nextGroupRecords);
+      storage.saveRecords(nextRecords);
+      if (removedIds.length) engine.removeStatuses(removedIds);
+      storage.appendLog({
+        level: "info",
+        action: "group-update",
+        message: `更新节点规则组，现有 ${nextGroupRecords.length} 条 DNS 目标${
+          removedIds.length ? `，移除 ${removedIds.length} 条目标规则` : ""
+        }。`,
+      });
+      setNoStore(res);
+      jsonResponse(res, {
+        ok: true,
+        group: groupRecords(nextGroupRecords)[0],
+        removedTargets: removedIds.length,
       });
     } catch (error) {
       fail(res, error);
@@ -234,42 +371,45 @@ export function registerRoutes(deps: RouteDependencies): void {
     try {
       requireCsrf(req, csrf);
       const body = bodyOf(req);
-      const ids = parseIds(body.ids);
+      const groupIds = parseIds(body.ids);
       const action = String(body.action || "");
-      const idSet = new Set(ids);
+      const idSet = new Set(groupIds);
       const records = storage.loadRecords();
+      const selectedGroups = groupRecords(records).filter((group) => idSet.has(group.id));
+      if (!selectedGroups.length) throw new PluginError("所选规则组不存在。", 404);
+      const recordIds = selectedGroups.flatMap((group) => group.recordIds);
       if (action === "enable" || action === "disable") {
         ensureIdle(engine);
         const enabled = action === "enable";
         const updated = records.map((record) =>
-          idSet.has(record.id) ? { ...record, enabled, updatedAt: nowIso() } : record,
+          idSet.has(record.groupId) ? { ...record, enabled, updatedAt: nowIso() } : record,
         );
         storage.saveRecords(updated);
         storage.appendLog({
           level: "info",
           action: enabled ? "bulk-enable" : "bulk-disable",
-          message: `${enabled ? "启用" : "停用"} ${ids.length} 条规则。`,
+          message: `${enabled ? "启用" : "停用"} ${selectedGroups.length} 个节点规则组。`,
         });
         setNoStore(res);
-        jsonResponse(res, { ok: true, affected: ids.length });
+        jsonResponse(res, { ok: true, affectedGroups: selectedGroups.length });
         return;
       }
       if (action === "delete") {
         ensureIdle(engine);
-        const remaining = records.filter((record) => !idSet.has(record.id));
+        const remaining = records.filter((record) => !idSet.has(record.groupId));
         storage.saveRecords(remaining);
-        engine.removeStatuses(ids);
+        engine.removeStatuses(recordIds);
         storage.appendLog({
           level: "warning",
           action: "bulk-delete",
-          message: `删除 ${records.length - remaining.length} 条规则，Cloudflare DNS 记录保留。`,
+          message: `删除 ${selectedGroups.length} 个节点规则组，Cloudflare DNS 记录保留。`,
         });
         setNoStore(res);
-        jsonResponse(res, { ok: true, affected: records.length - remaining.length });
+        jsonResponse(res, { ok: true, affectedGroups: selectedGroups.length });
         return;
       }
       if (action === "sync") {
-        const job = engine.start(ids, true);
+        const job = engine.start(recordIds, true);
         setNoStore(res);
         jsonResponse(res, { ok: true, job });
         return;
@@ -285,8 +425,20 @@ export function registerRoutes(deps: RouteDependencies): void {
     try {
       requireCsrf(req, csrf);
       const body = bodyOf(req);
-      const ids = Array.isArray(body.ids) ? parseIds(body.ids) : undefined;
-      const job = engine.start(ids, body.force === false ? false : true);
+      const groupIds = Array.isArray(body.groupIds)
+        ? parseIds(body.groupIds)
+        : Array.isArray(body.ids)
+          ? parseIds(body.ids)
+          : undefined;
+      let recordIds: string[] | undefined;
+      if (groupIds) {
+        const selected = new Set(groupIds);
+        recordIds = groupRecords(storage.loadRecords())
+          .filter((group) => selected.has(group.id))
+          .flatMap((group) => group.recordIds);
+        if (!recordIds.length) throw new PluginError("所选规则组不存在。", 404);
+      }
+      const job = engine.start(recordIds, body.force === false ? false : true);
       setNoStore(res);
       jsonResponse(res, { ok: true, job });
     } catch (error) {

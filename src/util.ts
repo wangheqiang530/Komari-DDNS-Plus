@@ -32,6 +32,10 @@ export function makeId(bytes = 12): string {
   return crypto.randomBytes(bytes).toString("hex");
 }
 
+export function stableId(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex").slice(0, 24);
+}
+
 export function normalizeDomain(value: unknown): string {
   const raw = typeof value === "string" ? value.trim().toLowerCase() : "";
   const name = raw.replace(/\.$/, "");
@@ -141,6 +145,9 @@ export function normalizeSettings(input: unknown, previous?: Settings): Settings
   if (raw.notify !== undefined && typeof raw.notify !== "boolean") {
     throw new PluginError("通知开关格式无效。");
   }
+  if (raw.paused !== undefined && typeof raw.paused !== "boolean") {
+    throw new PluginError("暂停开关格式无效。");
+  }
 
   return {
     version: 1,
@@ -149,6 +156,7 @@ export function normalizeSettings(input: unknown, previous?: Settings): Settings
     email,
     apiKey,
     notify: raw.notify === undefined ? Boolean(previous?.notify) : Boolean(raw.notify),
+    paused: raw.paused === undefined ? Boolean(previous?.paused) : Boolean(raw.paused),
     intervalMinutes,
     updatedAt: nowIso(),
   };
@@ -187,6 +195,7 @@ export function publicSettings(settings: Settings): PublicSettings {
     hasToken: Boolean(settings.token),
     hasApiKey: Boolean(settings.apiKey),
     notify: settings.notify,
+    paused: settings.paused,
     intervalMinutes: settings.intervalMinutes,
     updatedAt: settings.updatedAt,
   };
@@ -231,8 +240,14 @@ export function normalizeRecord(
   if (!/^[a-zA-Z0-9-]{1,64}$/.test(nodeUuid)) throw new PluginError("节点 UUID 无效。");
   const id = typeof raw.id === "string" && raw.id ? raw.id : previous?.id || makeId();
   if (!/^[a-zA-Z0-9-]{8,64}$/.test(id)) throw new PluginError("规则 ID 无效。");
+  const groupId =
+    typeof raw.groupId === "string" && raw.groupId
+      ? raw.groupId
+      : previous?.groupId || makeId();
+  if (!/^[a-zA-Z0-9-]{8,64}$/.test(groupId)) throw new PluginError("规则组 ID 无效。");
   return {
     id,
+    groupId,
     domain: normalizeDomain(raw.domain),
     type,
     nodeUuid,

@@ -37,6 +37,7 @@ export interface Settings {
   email: string;
   apiKey: string;
   notify: boolean;
+  paused: boolean;
   intervalMinutes: number;
   updatedAt: string;
 }
@@ -47,12 +48,14 @@ export interface PublicSettings {
   hasToken: boolean;
   hasApiKey: boolean;
   notify: boolean;
+  paused: boolean;
   intervalMinutes: number;
   updatedAt: string;
 }
 
 export interface DdnsRecord {
   id: string;
+  groupId: string;
   domain: string;
   type: DnsRecordType;
   nodeUuid: string;
@@ -61,6 +64,21 @@ export interface DdnsRecord {
   enabled: boolean;
   intervalMinutes: number;
   adoptExisting: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RuleGroup {
+  id: string;
+  nodeUuid: string;
+  domains: string[];
+  mode: CreateMode;
+  ttl: number;
+  proxied: boolean;
+  enabled: boolean;
+  intervalMinutes: number;
+  adoptExisting: boolean;
+  recordIds: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -118,6 +136,25 @@ export interface BatchInput {
   intervalMinutes: number;
   enabled: boolean;
   adoptExisting: boolean;
+}
+
+export interface NotificationChange {
+  record: DdnsRecord;
+  nodeName: string;
+  previousIp?: string;
+  currentIp: string;
+  action: "created" | "updated";
+}
+
+export interface NotificationFailure {
+  record: DdnsRecord;
+  nodeName: string;
+  message: string;
+}
+
+export interface NotificationPayload {
+  message: string;
+  clients: string[];
 }
 
 export interface AuthCredentials {

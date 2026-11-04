@@ -4,6 +4,9 @@ import { Storage } from "./storage";
 import {
   CloudflareRecord,
   DdnsRecord,
+  NotificationChange,
+  NotificationFailure,
+  NotificationPayload,
   NodeInfo,
   RecordStatus,
   Settings,
@@ -22,13 +25,20 @@ const SYNC_CHUNK_SIZE = 10;
 export interface SyncDependencies {
   storage: Storage;
   getNodes: (uuids?: string[]) => Promise<NodeInfo[]>;
-  notify: (message: string) => Promise<void>;
+  notify: (payload: NotificationPayload) => Promise<void>;
   createClient?: (settings: Settings) => CloudflareClient;
 }
 
 export interface SyncSnapshot {
   job: SyncJob;
   statuses: Record<string, RecordStatus>;
+}
+
+interface RecordSyncResult {
+  changed: boolean;
+  action?: "created" | "updated" | "unchanged" | "skipped";
+  previousIp?: string;
+  currentIp?: string;
 }
 
 function hasCredentials(settings: Settings): boolean {
@@ -111,6 +121,8 @@ export class SyncEngine {
   private job: SyncJob = emptyJob();
   private statuses: Record<string, RecordStatus>;
   private blockedUntil = 0;
+  private changes: NotificationChange[] = [];
+  private failures: NotificationFailure[] = [];
 
   constructor(deps: SyncDependencies) {
     this.deps = deps;
@@ -181,7 +193,12 @@ export class SyncEngine {
   }
 
   startDue(): SyncJob {
-    if (!hasCredentials(this.deps.storage.loadSettings())) {
+    const settings = this.deps.storage.loadSettings();
+    if (settings.paused) {
+      this.job = { ...this.job, message: "计划同步已暂停。" };
+      return { ...this.job };
+    }
+    if (!hasCredentials(settings)) {
       this.job = { ...emptyJob(), message: "尚未配置 Cloudflare 凭据。" };
       return { ...this.job };
     }
@@ -190,6 +207,8 @@ export class SyncEngine {
 
   private async run(records: DdnsRecord[]): Promise<void> {
     const settings = this.deps.storage.loadSettings();
+    this.changes = [];
+    this.failures = [];
     const client = this.deps.createClient
       ? this.deps.createClient(settings)
       : createCloudflareClient(settings);
@@ -199,8 +218,10 @@ export class SyncEngine {
     for (let offset = 0; offset < records.length; offset += SYNC_CHUNK_SIZE) {
       const chunk = records.slice(offset, offset + SYNC_CHUNK_SIZE);
       for (const record of chunk) {
+        const previousStatus = this.statuses[record.id];
+        let result: RecordSyncResult | undefined;
         try {
-          await this.syncRecord(record, client, nodeMap);
+          result = await this.syncRecord(record, client, nodeMap);
         } catch (error) {
           const message = redact(errorMessage(error), settings);
           if (error instanceof CloudflareError && error.status === 429) {
@@ -211,6 +232,13 @@ export class SyncEngine {
             lastError: message,
           });
           this.job.errors += 1;
+          if (previousStatus?.state !== "error") {
+            this.failures.push({
+              record,
+              nodeName: nodeMap.get(record.nodeUuid)?.name || record.nodeUuid,
+              message,
+            });
+          }
           this.deps.storage.appendLog({
             level: "error",
             action: "sync",
@@ -218,6 +246,19 @@ export class SyncEngine {
             domain: record.domain,
             type: record.type,
             nodeUuid: record.nodeUuid,
+          });
+        }
+        if (
+          result?.changed &&
+          (result.action === "created" || result.action === "updated") &&
+          (result.action === "created" || result.previousIp !== result.currentIp)
+        ) {
+          this.changes.push({
+            record,
+            nodeName: nodeMap.get(record.nodeUuid)?.name || record.nodeUuid,
+            previousIp: result.previousIp,
+            currentIp: result.currentIp || "",
+            action: result.action,
           });
         }
         this.job.completed += 1;
@@ -235,16 +276,58 @@ export class SyncEngine {
       message: this.job.message,
     });
 
-    if (settings.notify && (this.job.changed > 0 || this.job.errors > 0)) {
-      try {
-        await this.deps.notify(this.job.message);
-      } catch (error) {
-        this.deps.storage.appendLog({
-          level: "warning",
-          action: "notify",
-          message: `通知发送失败：${redact(errorMessage(error), settings)}`,
-        });
+    await this.sendNotificationSummary(settings);
+  }
+
+  private async sendNotificationSummary(settings: Settings): Promise<void> {
+    if (!settings.notify || (this.changes.length === 0 && this.failures.length === 0)) {
+      return;
+    }
+    const lines: string[] = [];
+    if (this.changes.length) {
+      lines.push(`IP 变更 ${this.changes.length} 条：`);
+      for (const change of this.changes.slice(0, 8)) {
+        const before = change.action === "created" ? "新建" : change.previousIp || "未知";
+        lines.push(
+          `- ${change.nodeName} / ${change.record.domain} ${change.record.type}: ${before} -> ${change.currentIp}`,
+        );
       }
+      if (this.changes.length > 8) {
+        lines.push(`- 另有 ${this.changes.length - 8} 条变更未列出`);
+      }
+    }
+    if (this.failures.length) {
+      if (lines.length) lines.push("");
+      lines.push(`同步失败 ${this.failures.length} 条：`);
+      for (const failure of this.failures.slice(0, 8)) {
+        const detail =
+          failure.message.length > 160
+            ? failure.message.slice(0, 157) + "..."
+            : failure.message;
+        lines.push(
+          `- ${failure.nodeName} / ${failure.record.domain} ${failure.record.type}: ${detail}`,
+        );
+      }
+      if (this.failures.length > 8) {
+        lines.push(`- 另有 ${this.failures.length - 8} 条失败未列出`);
+      }
+    }
+    const clients = Array.from(
+      new Set(
+        [...this.changes, ...this.failures].map((item) => item.record.nodeUuid),
+      ),
+    );
+    try {
+      await this.deps.notify({
+        message: lines.join("\n").slice(0, 3500),
+        clients,
+      });
+    } catch (error) {
+      this.deps.storage.appendLog({
+        level: "warning",
+        action: "notify",
+        message: `通知发送失败：${redact(errorMessage(error), settings)}`,
+      });
     }
   }
 
@@ -252,13 +335,13 @@ export class SyncEngine {
     record: DdnsRecord,
     client: ReturnType<typeof createCloudflareClient>,
     nodes: Map<string, NodeInfo>,
-  ): Promise<void> {
+  ): Promise<RecordSyncResult> {
     if (!record.enabled) {
       this.statuses[record.id] = statusForRecord(record, "disabled", {
         action: "skipped",
       });
       this.job.skipped += 1;
-      return;
+      return { changed: false, action: "skipped" };
     }
 
     const node = nodes.get(record.nodeUuid);
@@ -279,14 +362,16 @@ export class SyncEngine {
         type: record.type,
         nodeUuid: record.nodeUuid,
       });
-      return;
+      return { changed: false, action: "skipped" };
     }
 
     const ip = validateAddress(record.type === "A" ? node.ipv4 : node.ipv6, record.type);
     const zone = await client.zoneFor(record.domain);
     const existing = await client.listRecords(zone.id, record.domain, record.type);
     const marker = recordMarker(record.id);
-    const managed = existing.filter((item) => item.comment === marker);
+    const managed = existing.filter(
+      (item) => item.type === record.type && item.name === record.domain && item.comment === marker,
+    );
     if (managed.length > 1) {
       throw new PluginError("发现多条由本插件管理的重复 DNS 记录，请先到 Cloudflare 整理。", 422);
     }
@@ -294,6 +379,22 @@ export class SyncEngine {
     let current: CloudflareRecord | undefined = managed[0];
     if (!current && this.statuses[record.id]?.recordId) {
       current = existing.find((item) => item.id === this.statuses[record.id]?.recordId);
+    }
+
+    if (!current) {
+      const orphanedManaged = existing.filter(
+        (item) =>
+          item.type === record.type &&
+          item.name === record.domain &&
+          String(item.comment || "").startsWith("komari-ddns-plus:"),
+      );
+      if (orphanedManaged.length > 1) {
+        throw new PluginError(
+          "目标域名存在多条本插件历史记录，请先到 Cloudflare 整理。",
+          422,
+        );
+      }
+      if (orphanedManaged.length === 1) current = orphanedManaged[0];
     }
 
     if (!current) {
@@ -333,7 +434,12 @@ export class SyncEngine {
         lastChangedAt: this.statuses[record.id]?.lastChangedAt,
       });
       this.job.skipped += 1;
-      return;
+      return {
+        changed: false,
+        action: "unchanged",
+        previousIp: current.content,
+        currentIp: ip,
+      };
     }
 
     const updated = current
@@ -356,5 +462,11 @@ export class SyncEngine {
       type: record.type,
       nodeUuid: record.nodeUuid,
     });
+    return {
+      changed: true,
+      action: current ? "updated" : "created",
+      previousIp: current?.content,
+      currentIp: ip,
+    };
   }
 }

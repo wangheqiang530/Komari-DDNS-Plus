@@ -7,11 +7,13 @@ export function expandBatch(input: BatchInput, settingsInterval: number): DdnsRe
   const records: DdnsRecord[] = [];
   const at = nowIso();
   for (const nodeUuid of input.nodeUuids) {
+    const groupId = makeId();
     for (const domain of input.domains) {
       for (const type of types) {
         records.push(
           normalizeRecord({
             id: makeId(),
+            groupId,
             domain,
             type,
             nodeUuid,

@@ -1,6 +1,6 @@
 {
   "name": "komari-plugin-ddns-plus",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "private": true,
   "description": "Batch Cloudflare DDNS for Komari with IPv4 and IPv6 support",
   "license": "MIT",

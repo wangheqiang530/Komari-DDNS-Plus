@@ -2,7 +2,7 @@
 
 Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 Komari 节点上报的 IPv4/IPv6 地址，批量维护 Cloudflare DNS 记录。
 
-当前版本：`0.0.1`
+当前版本：`0.0.2`
 
 ## 功能
 
@@ -10,14 +10,19 @@ Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 K
 - 域名批量输入，支持换行、逗号和空格分隔。
 - `IPv4`、`IPv6`、`IPv4 + IPv6` 三种模式。
 - 同一域名自动维护独立的 A 和 AAAA 记录。
+- 每台节点显示为一个规则组，可展开查看目标明细并编辑。
+- 同一个节点可创建多个规则组，例如独立的 IPv4 组和 IPv6 组。
 - 支持 Cloudflare API Token 或邮箱 + Global API Key。
-- 设置页提供连接测试，不会写入 DNS。
+- 设置页提供连接测试，不会写入 DNS；支持用户 API Token 和 Account API Token。
 - TTL、Cloudflare 代理、同步间隔和通知开关。
-- 记录级状态、当前 IP、上次同步时间和错误信息。
+- 规则组状态、目标级当前 IP、上次同步时间和错误信息。
 - 批量启用、停用、删除和立即同步。
+- 全局暂停或恢复计划同步，手动同步不受影响。
 - Cloudflare Zone 自动匹配和 5 分钟缓存。
 - 429 限流识别、分块同步和状态持久化。
-- 运行日志和通知汇总。
+- 运行日志和带节点、域名、类型、IP 明细的变更通知。
+- 仅 IP 变更或失败状态开始时通知，持续失败不会反复发送。
+- 自动迁移 v0.0.1 的平铺记录为节点规则组。
 
 ## 环境
 
@@ -28,12 +33,12 @@ Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 K
 
 ## 安装
 
-1. 在 GitHub Releases 下载 `ddns-plus-0.0.1.zip`。
+1. 在 GitHub Releases 下载 `ddns-plus-0.0.2.zip`。
 2. 在 Komari 后台的插件管理页面上传 ZIP。
 3. 启用插件并批准系统 RPC 和 HTTP 路由权限。
 4. 打开后台侧边栏的 **DDNS Plus** 页面。
 5. 在“设置”标签中配置 Cloudflare 凭据并测试连接。
-6. 在“DDNS 规则”标签中批量选择节点和域名。
+6. 在“节点规则”标签中选择节点和域名并创建规则组。
 
 覆盖升级时直接上传新版 ZIP，不要先卸载，否则插件存储数据可能被清除。
 
@@ -41,12 +46,12 @@ Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 K
 
 ### 推荐：API Token
 
-在 Cloudflare 控制台的 **My Profile > API Tokens** 创建用户 API Token，至少授予：
+在 Cloudflare 控制台的 **My Profile > API Tokens** 创建用户 API Token，或使用 Account API Token，至少授予：
 
-- `Zone.Zone:Read`
-- `Zone.DNS:Edit`
+- `Zone > Zone > Read`
+- `Zone > DNS > Edit`
 
-插件使用 `Authorization: Bearer <token>`。
+插件使用 `Authorization: Bearer <token>`。测试连接会直接检查 Zone 和 DNS 记录读取权限，不依赖 `/user/tokens/verify`，因此 Account API Token 也可以正常测试。
 
 ### Global API Key
 
@@ -61,12 +66,13 @@ Global API Key 拥有账户级完整权限，建议仅在 API Token 不适用时
 
 ## 使用说明
 
-- 一条规则对应一个域名、一个节点和一种记录类型。
-- 选择多台节点和双栈模式时，会展开成多条独立记录。
-- 多台节点绑定同一个域名和类型时，Cloudflare 会存在多条同名记录，这不是故障切换。
+- 一个节点规则组对应一台节点、一组域名和一种地址模式。
+- 同一个节点可以重复创建规则组，但不同组之间不能管理同一个域名和记录类型。
+- 双栈规则组会为每个域名维护独立的 A 和 AAAA 目标。
+- 多台节点选择后会分别生成节点规则组，每台节点一行。
 - TTL `1` 在 Cloudflare 中表示“自动”，不是 1 秒。
 - 开启 Cloudflare 代理时，TTL 会强制使用自动。
-- 删除插件规则默认保留 Cloudflare 上的 DNS 记录。
+- 删除规则组或编辑时移除目标，默认保留 Cloudflare 上的 DNS 记录。
 - 已有非插件管理的记录不会被覆盖；需要接管时勾选“接管唯一已有记录”。
 - 插件最多保存 1000 条 DNS 规则。
 
@@ -76,7 +82,7 @@ Global API Key 拥有账户级完整权限，建议仅在 API Token 不适用时
 
 ```text
 settings.json   Cloudflare 凭据和全局设置
-records.json    展开后的 A/AAAA 规则
+records.json    带 groupId 的 A/AAAA 目标记录
 status.json     每条规则的最后同步状态
 logs.json       最近的运行日志
 ```
@@ -97,7 +103,7 @@ npm run pack
 生成的安装包：
 
 ```text
-dist/ddns-plus-0.0.1.zip
+dist/ddns-plus-0.0.2.zip
 ```
 
 管理页本地预览地址：
@@ -122,12 +128,12 @@ http://127.0.0.1:18795/pages/admin.html
 npm run dev
 ```
 
-## v0.0.1 限制
+## v0.0.2 限制
 
-- 删除规则时暂不提供 Cloudflare DNS 记录清理。
-- 暂不支持逐条编辑已有规则。
-- 暂不支持按域名映射不同节点，批量创建使用节点与域名的笛卡尔积。
-- 通知按一次同步任务汇总发送，不逐条发送。
+- 删除规则组时暂不提供 Cloudflare DNS 记录清理。
+- 暂不支持在规则组内单独编辑某个域名目标。
+- 暂不支持一个规则组内按域名映射不同节点。
+- 通知按一次同步任务汇总发送，不逐条发送；同一失败状态持续期间只通知首次。
 
 ## License
 

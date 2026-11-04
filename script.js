@@ -483,6 +483,9 @@
   function makeId(bytes = 12) {
     return import_node_crypto.default.randomBytes(bytes).toString("hex");
   }
+  function stableId(value) {
+    return import_node_crypto.default.createHash("sha256").update(value).digest("hex").slice(0, 24);
+  }
   function normalizeDomain(value) {
     const raw = typeof value === "string" ? value.trim().toLowerCase() : "";
     const name = raw.replace(/\.$/, "");
@@ -559,6 +562,9 @@
     if (raw.notify !== void 0 && typeof raw.notify !== "boolean") {
       throw new PluginError("\u901A\u77E5\u5F00\u5173\u683C\u5F0F\u65E0\u6548\u3002");
     }
+    if (raw.paused !== void 0 && typeof raw.paused !== "boolean") {
+      throw new PluginError("\u6682\u505C\u5F00\u5173\u683C\u5F0F\u65E0\u6548\u3002");
+    }
     return {
       version: 1,
       authMode,
@@ -566,6 +572,7 @@
       email,
       apiKey,
       notify: raw.notify === void 0 ? Boolean(previous?.notify) : Boolean(raw.notify),
+      paused: raw.paused === void 0 ? Boolean(previous?.paused) : Boolean(raw.paused),
       intervalMinutes,
       updatedAt: nowIso()
     };
@@ -593,6 +600,7 @@
       hasToken: Boolean(settings.token),
       hasApiKey: Boolean(settings.apiKey),
       notify: settings.notify,
+      paused: settings.paused,
       intervalMinutes: settings.intervalMinutes,
       updatedAt: settings.updatedAt
     };
@@ -631,8 +639,11 @@
     if (!/^[a-zA-Z0-9-]{1,64}$/.test(nodeUuid)) throw new PluginError("\u8282\u70B9 UUID \u65E0\u6548\u3002");
     const id = typeof raw.id === "string" && raw.id ? raw.id : previous?.id || makeId();
     if (!/^[a-zA-Z0-9-]{8,64}$/.test(id)) throw new PluginError("\u89C4\u5219 ID \u65E0\u6548\u3002");
+    const groupId = typeof raw.groupId === "string" && raw.groupId ? raw.groupId : previous?.groupId || makeId();
+    if (!/^[a-zA-Z0-9-]{8,64}$/.test(groupId)) throw new PluginError("\u89C4\u5219\u7EC4 ID \u65E0\u6548\u3002");
     return {
       id,
+      groupId,
       domain: normalizeDomain(raw.domain),
       type,
       nodeUuid,
@@ -869,14 +880,51 @@
       );
     }
     async function test() {
-      if (auth.authMode === "token") {
-        await request("/user/tokens/verify");
-      } else {
+      if (auth.authMode === "key") {
         await request("/user");
       }
-      const zones = await listZones();
+      let zones;
+      try {
+        zones = await listZones();
+      } catch (error) {
+        if (auth.authMode === "token" && error instanceof CloudflareError && (error.status === 401 || error.status === 403)) {
+          throw new CloudflareError(
+            "API Token \u65E0\u6CD5\u8BFB\u53D6 Zone\u3002\u8BF7\u6388\u4E88 Zone > Zone > Read\uFF0C\u5E76\u6388\u6743\u76EE\u6807\u57DF\u540D\uFF1BAccount API Token \u4E5F\u53EF\u4EE5\u76F4\u63A5\u4F7F\u7528\u3002",
+            error.status,
+            typeof error.code === "number" ? error.code : void 0
+          );
+        }
+        throw error;
+      }
+      if (zones.length > 0) {
+        let dnsReadable = false;
+        let dnsError;
+        for (const zone of zones) {
+          try {
+            await request(
+              `/zones/${encodeURIComponent(zone.id)}/dns_records?per_page=1`
+            );
+            dnsReadable = true;
+            break;
+          } catch (error) {
+            if (error instanceof CloudflareError && (error.status === 401 || error.status === 403)) {
+              dnsError = error;
+              continue;
+            }
+            throw error;
+          }
+        }
+        if (!dnsReadable && dnsError) {
+          throw new CloudflareError(
+            "API Token \u53EF\u4EE5\u8BFB\u53D6 Zone\uFF0C\u4F46\u7F3A\u5C11 DNS \u8BB0\u5F55\u8BFB\u53D6\u6743\u9650\u3002\u8BF7\u6388\u4E88 Zone > DNS > Edit\uFF0C\u5E76\u6388\u6743\u76EE\u6807\u57DF\u540D\u3002",
+            dnsError.status,
+            typeof dnsError.code === "number" ? dnsError.code : void 0
+          );
+        }
+      }
+      const suffix = zones.length ? `\u53EF\u8BFB\u53D6 ${zones.length} \u4E2A\u6709\u6548 Zone\uFF0C\u5E76\u5177\u5907 DNS \u8BB0\u5F55\u8BFB\u53D6\u6743\u9650\u3002` : "\u4F46\u5F53\u524D\u51ED\u636E\u672A\u6388\u6743\u4EFB\u4F55\u6709\u6548 Zone\u3002";
       return {
-        message: auth.authMode === "token" ? `API Token \u9A8C\u8BC1\u6210\u529F\uFF0C\u53EF\u8BFB\u53D6 ${zones.length} \u4E2A\u6709\u6548 Zone\u3002` : `Global API Key \u9A8C\u8BC1\u6210\u529F\uFF0C\u53EF\u8BFB\u53D6 ${zones.length} \u4E2A\u6709\u6548 Zone\u3002`,
+        message: auth.authMode === "token" ? `API Token \u9A8C\u8BC1\u6210\u529F\uFF0C${suffix}` : `Global API Key \u9A8C\u8BC1\u6210\u529F\uFF0C${suffix}`,
         zoneCount: zones.length
       };
     }
@@ -962,6 +1010,8 @@
     constructor(deps) {
       this.job = emptyJob();
       this.blockedUntil = 0;
+      this.changes = [];
+      this.failures = [];
       this.deps = deps;
       this.statuses = deps.storage.loadStatuses();
     }
@@ -1025,7 +1075,12 @@
       return { ...this.job };
     }
     startDue() {
-      if (!hasCredentials(this.deps.storage.loadSettings())) {
+      const settings = this.deps.storage.loadSettings();
+      if (settings.paused) {
+        this.job = { ...this.job, message: "\u8BA1\u5212\u540C\u6B65\u5DF2\u6682\u505C\u3002" };
+        return { ...this.job };
+      }
+      if (!hasCredentials(settings)) {
         this.job = { ...emptyJob(), message: "\u5C1A\u672A\u914D\u7F6E Cloudflare \u51ED\u636E\u3002" };
         return { ...this.job };
       }
@@ -1033,14 +1088,18 @@
     }
     async run(records) {
       const settings = this.deps.storage.loadSettings();
+      this.changes = [];
+      this.failures = [];
       const client = this.deps.createClient ? this.deps.createClient(settings) : createCloudflareClient(settings);
       const nodes = await this.deps.getNodes(Array.from(new Set(records.map((record) => record.nodeUuid))));
       const nodeMap = new Map(nodes.map((node) => [node.uuid, node]));
       for (let offset = 0; offset < records.length; offset += SYNC_CHUNK_SIZE) {
         const chunk = records.slice(offset, offset + SYNC_CHUNK_SIZE);
         for (const record of chunk) {
+          const previousStatus = this.statuses[record.id];
+          let result;
           try {
-            await this.syncRecord(record, client, nodeMap);
+            result = await this.syncRecord(record, client, nodeMap);
           } catch (error) {
             const message = redact(errorMessage(error), settings);
             if (error instanceof CloudflareError && error.status === 429) {
@@ -1051,6 +1110,13 @@
               lastError: message
             });
             this.job.errors += 1;
+            if (previousStatus?.state !== "error") {
+              this.failures.push({
+                record,
+                nodeName: nodeMap.get(record.nodeUuid)?.name || record.nodeUuid,
+                message
+              });
+            }
             this.deps.storage.appendLog({
               level: "error",
               action: "sync",
@@ -1058,6 +1124,15 @@
               domain: record.domain,
               type: record.type,
               nodeUuid: record.nodeUuid
+            });
+          }
+          if (result?.changed && (result.action === "created" || result.action === "updated") && (result.action === "created" || result.previousIp !== result.currentIp)) {
+            this.changes.push({
+              record,
+              nodeName: nodeMap.get(record.nodeUuid)?.name || record.nodeUuid,
+              previousIp: result.previousIp,
+              currentIp: result.currentIp || "",
+              action: result.action
             });
           }
           this.job.completed += 1;
@@ -1073,16 +1148,54 @@
         action: "sync",
         message: this.job.message
       });
-      if (settings.notify && (this.job.changed > 0 || this.job.errors > 0)) {
-        try {
-          await this.deps.notify(this.job.message);
-        } catch (error) {
-          this.deps.storage.appendLog({
-            level: "warning",
-            action: "notify",
-            message: `\u901A\u77E5\u53D1\u9001\u5931\u8D25\uFF1A${redact(errorMessage(error), settings)}`
-          });
+      await this.sendNotificationSummary(settings);
+    }
+    async sendNotificationSummary(settings) {
+      if (!settings.notify || this.changes.length === 0 && this.failures.length === 0) {
+        return;
+      }
+      const lines = [];
+      if (this.changes.length) {
+        lines.push(`IP \u53D8\u66F4 ${this.changes.length} \u6761\uFF1A`);
+        for (const change of this.changes.slice(0, 8)) {
+          const before = change.action === "created" ? "\u65B0\u5EFA" : change.previousIp || "\u672A\u77E5";
+          lines.push(
+            `- ${change.nodeName} / ${change.record.domain} ${change.record.type}: ${before} -> ${change.currentIp}`
+          );
         }
+        if (this.changes.length > 8) {
+          lines.push(`- \u53E6\u6709 ${this.changes.length - 8} \u6761\u53D8\u66F4\u672A\u5217\u51FA`);
+        }
+      }
+      if (this.failures.length) {
+        if (lines.length) lines.push("");
+        lines.push(`\u540C\u6B65\u5931\u8D25 ${this.failures.length} \u6761\uFF1A`);
+        for (const failure of this.failures.slice(0, 8)) {
+          const detail = failure.message.length > 160 ? failure.message.slice(0, 157) + "..." : failure.message;
+          lines.push(
+            `- ${failure.nodeName} / ${failure.record.domain} ${failure.record.type}: ${detail}`
+          );
+        }
+        if (this.failures.length > 8) {
+          lines.push(`- \u53E6\u6709 ${this.failures.length - 8} \u6761\u5931\u8D25\u672A\u5217\u51FA`);
+        }
+      }
+      const clients = Array.from(
+        new Set(
+          [...this.changes, ...this.failures].map((item) => item.record.nodeUuid)
+        )
+      );
+      try {
+        await this.deps.notify({
+          message: lines.join("\n").slice(0, 3500),
+          clients
+        });
+      } catch (error) {
+        this.deps.storage.appendLog({
+          level: "warning",
+          action: "notify",
+          message: `\u901A\u77E5\u53D1\u9001\u5931\u8D25\uFF1A${redact(errorMessage(error), settings)}`
+        });
       }
     }
     async syncRecord(record, client, nodes) {
@@ -1091,7 +1204,7 @@
           action: "skipped"
         });
         this.job.skipped += 1;
-        return;
+        return { changed: false, action: "skipped" };
       }
       const node = nodes.get(record.nodeUuid);
       if (!node) {
@@ -1111,19 +1224,33 @@
           type: record.type,
           nodeUuid: record.nodeUuid
         });
-        return;
+        return { changed: false, action: "skipped" };
       }
       const ip = validateAddress(record.type === "A" ? node.ipv4 : node.ipv6, record.type);
       const zone = await client.zoneFor(record.domain);
       const existing = await client.listRecords(zone.id, record.domain, record.type);
       const marker = recordMarker(record.id);
-      const managed = existing.filter((item) => item.comment === marker);
+      const managed = existing.filter(
+        (item) => item.type === record.type && item.name === record.domain && item.comment === marker
+      );
       if (managed.length > 1) {
         throw new PluginError("\u53D1\u73B0\u591A\u6761\u7531\u672C\u63D2\u4EF6\u7BA1\u7406\u7684\u91CD\u590D DNS \u8BB0\u5F55\uFF0C\u8BF7\u5148\u5230 Cloudflare \u6574\u7406\u3002", 422);
       }
       let current = managed[0];
       if (!current && this.statuses[record.id]?.recordId) {
         current = existing.find((item) => item.id === this.statuses[record.id]?.recordId);
+      }
+      if (!current) {
+        const orphanedManaged = existing.filter(
+          (item) => item.type === record.type && item.name === record.domain && String(item.comment || "").startsWith("komari-ddns-plus:")
+        );
+        if (orphanedManaged.length > 1) {
+          throw new PluginError(
+            "\u76EE\u6807\u57DF\u540D\u5B58\u5728\u591A\u6761\u672C\u63D2\u4EF6\u5386\u53F2\u8BB0\u5F55\uFF0C\u8BF7\u5148\u5230 Cloudflare \u6574\u7406\u3002",
+            422
+          );
+        }
+        if (orphanedManaged.length === 1) current = orphanedManaged[0];
       }
       if (!current) {
         const unmanaged = existing.filter((item) => !String(item.comment || "").startsWith("komari-ddns-plus:"));
@@ -1154,7 +1281,12 @@
           lastChangedAt: this.statuses[record.id]?.lastChangedAt
         });
         this.job.skipped += 1;
-        return;
+        return {
+          changed: false,
+          action: "unchanged",
+          previousIp: current.content,
+          currentIp: ip
+        };
       }
       const updated = current ? await client.updateRecord(zone.id, current.id, payload) : await client.createRecord(zone.id, payload);
       const changedAt = nowIso();
@@ -1174,6 +1306,12 @@
         type: record.type,
         nodeUuid: record.nodeUuid
       });
+      return {
+        changed: true,
+        action: current ? "updated" : "created",
+        previousIp: current?.content,
+        currentIp: ip
+      };
     }
   };
 
@@ -1186,11 +1324,13 @@
     const records = [];
     const at = nowIso();
     for (const nodeUuid of input.nodeUuids) {
+      const groupId = makeId();
       for (const domain of input.domains) {
         for (const type of types) {
           records.push(
             normalizeRecord({
               id: makeId(),
+              groupId,
               domain,
               type,
               nodeUuid,
@@ -1207,6 +1347,62 @@
       }
     }
     return records;
+  }
+
+  // src/groups.ts
+  function groupRecords(records) {
+    const grouped = /* @__PURE__ */ new Map();
+    for (const record of records) {
+      const key = record.groupId || record.id;
+      const items = grouped.get(key) || [];
+      items.push(record);
+      grouped.set(key, items);
+    }
+    const result = [];
+    for (const [id, items] of grouped) {
+      const first = items[0];
+      if (!first) continue;
+      const domains = [];
+      const seenDomains = /* @__PURE__ */ new Set();
+      const types = /* @__PURE__ */ new Set();
+      for (const item of items) {
+        if (!seenDomains.has(item.domain)) {
+          seenDomains.add(item.domain);
+          domains.push(item.domain);
+        }
+        types.add(item.type);
+      }
+      const mode = types.has("A") && types.has("AAAA") ? "dual" : types.has("AAAA") ? "v6" : "v4";
+      const createdAt = items.reduce(
+        (oldest, item) => item.createdAt && item.createdAt < oldest ? item.createdAt : oldest,
+        first.createdAt || ""
+      );
+      const updatedAt = items.reduce(
+        (newest, item) => item.updatedAt && item.updatedAt > newest ? item.updatedAt : newest,
+        first.updatedAt || ""
+      );
+      result.push({
+        id,
+        nodeUuid: first.nodeUuid,
+        domains,
+        mode,
+        ttl: first.ttl,
+        proxied: first.proxied,
+        enabled: first.enabled,
+        intervalMinutes: first.intervalMinutes,
+        adoptExisting: first.adoptExisting,
+        recordIds: items.map((item) => item.id),
+        createdAt,
+        updatedAt
+      });
+    }
+    return result.sort((left, right) => {
+      const node = left.nodeUuid.localeCompare(right.nodeUuid);
+      return node || left.createdAt.localeCompare(right.createdAt);
+    });
+  }
+  function recordsForGroup(records, groupId) {
+    return records.filter((record) => record.groupId === groupId);
   }
 
   // src/routes.ts
@@ -1273,15 +1469,17 @@
     server2.route("GET", "/ddns-plus/state", (req, res) => {
       if (!requireAdmin(req, res)) return;
       const settings = storage2.loadSettings();
+      const records = storage2.loadRecords();
       const snapshot = engine2.snapshot();
       setNoStore(res);
       (0, import_plugin_sdk.jsonResponse)(res, {
         settings: publicSettings(settings),
-        records: storage2.loadRecords(),
+        records,
+        groups: groupRecords(records),
         statuses: snapshot.statuses,
         sync: snapshot.job,
         csrf: csrf2,
-        version: "0.0.1"
+        version: "0.0.2"
       });
     });
     server2.route("GET", "/ddns-plus/nodes", async (req, res) => {
@@ -1325,6 +1523,26 @@
         fail(res, error);
       }
     });
+    server2.route("POST", "/ddns-plus/pause", (req, res) => {
+      if (!requireAdmin(req, res)) return;
+      try {
+        requireCsrf(req, csrf2);
+        const paused = parseBoolean(bodyOf(req).paused, false, "\u6682\u505C\u5F00\u5173");
+        const settings = storage2.loadSettings();
+        settings.paused = paused;
+        settings.updatedAt = nowIso();
+        storage2.saveSettings(settings);
+        storage2.appendLog({
+          level: "info",
+          action: paused ? "pause" : "resume",
+          message: paused ? "\u5DF2\u6682\u505C\u8BA1\u5212\u540C\u6B65\u3002" : "\u5DF2\u6062\u590D\u8BA1\u5212\u540C\u6B65\u3002"
+        });
+        setNoStore(res);
+        (0, import_plugin_sdk.jsonResponse)(res, { paused });
+      } catch (error) {
+        fail(res, error);
+      }
+    });
     server2.route("POST", "/ddns-plus/records/batch", async (req, res) => {
       if (!requireAdmin(req, res)) return;
       try {
@@ -1363,27 +1581,120 @@
         const existing = new Set(
           records.map((record) => recordKey(record.domain, record.type, record.nodeUuid))
         );
-        const additions = generated.filter((record) => {
+        const duplicates = [];
+        for (const record of generated) {
           const key = recordKey(record.domain, record.type, record.nodeUuid);
-          if (existing.has(key)) return false;
-          existing.add(key);
-          return true;
-        });
-        assertRecordLimit(records.length + additions.length);
-        if (additions.length) {
-          storage2.saveRecords(records.concat(additions));
-          storage2.appendLog({
-            level: "info",
-            action: "batch-add",
-            message: `\u6279\u91CF\u6DFB\u52A0 ${additions.length} \u6761\u89C4\u5219\uFF0C\u8DF3\u8FC7 ${generated.length - additions.length} \u6761\u91CD\u590D\u89C4\u5219\u3002`
-          });
+          if (existing.has(key)) duplicates.push(`${record.domain} ${record.type}`);
         }
+        if (duplicates.length) {
+          throw new PluginError(
+            `\u4EE5\u4E0B\u76EE\u6807\u5DF2\u5B58\u5728\uFF0C\u4E0D\u80FD\u91CD\u590D\u521B\u5EFA\uFF1A${duplicates.slice(0, 5).join("\u3001")}${duplicates.length > 5 ? ` \u7B49 ${duplicates.length} \u6761` : ""}\u3002\u540C\u4E00\u4E2A\u8282\u70B9\u53EF\u4EE5\u521B\u5EFA\u4E0D\u540C\u6A21\u5F0F\u6216\u4E0D\u540C\u57DF\u540D\u7684\u89C4\u5219\u7EC4\u3002`,
+            409
+          );
+        }
+        assertRecordLimit(records.length + generated.length);
+        const groupsAdded = new Set(generated.map((record) => record.groupId)).size;
+        storage2.saveRecords(records.concat(generated));
+        storage2.appendLog({
+          level: "info",
+          action: "batch-add",
+          message: `\u65B0\u589E ${groupsAdded} \u4E2A\u8282\u70B9\u89C4\u5219\u7EC4\uFF0C\u5171 ${generated.length} \u6761 DNS \u76EE\u6807\u3002`
+        });
         setNoStore(res);
         (0, import_plugin_sdk.jsonResponse)(res, {
-          added: additions.length,
-          skipped: generated.length - additions.length,
-          total: records.length + additions.length,
-          records: additions
+          groupsAdded,
+          recordsAdded: generated.length,
+          totalRecords: records.length + generated.length,
+          groups: groupRecords(generated),
+          records: generated
+        });
+      } catch (error) {
+        fail(res, error);
+      }
+    });
+    server2.route("POST", "/ddns-plus/groups/update", (req, res) => {
+      if (!requireAdmin(req, res)) return;
+      try {
+        requireCsrf(req, csrf2);
+        ensureIdle(engine2);
+        const body = bodyOf(req);
+        const groupId = String(body.groupId || "").trim();
+        if (!/^[a-zA-Z0-9-]{8,64}$/.test(groupId)) {
+          throw new PluginError("\u89C4\u5219\u7EC4 ID \u65E0\u6548\u3002");
+        }
+        const records = storage2.loadRecords();
+        const groupItems = recordsForGroup(records, groupId);
+        if (!groupItems.length) throw new PluginError("\u89C4\u5219\u7EC4\u4E0D\u5B58\u5728\u3002", 404);
+        const first = groupItems[0];
+        const domains = parseDomains(body.domains);
+        const inferredMode = groupItems.some((item) => item.type === "AAAA") ? groupItems.some((item) => item.type === "A") ? "dual" : "v6" : "v4";
+        const mode = body.mode === void 0 ? inferredMode : parseMode(body.mode);
+        const proxied = parseBoolean(body.proxied, first.proxied, "\u4EE3\u7406\u5F00\u5173");
+        const ttl = normalizeTtl(body.ttl ?? first.ttl, proxied);
+        const intervalMinutes = normalizeInterval(
+          body.intervalMinutes ?? first.intervalMinutes
+        );
+        const enabled = parseBoolean(body.enabled, first.enabled, "\u542F\u7528\u5F00\u5173");
+        const adoptExisting = parseBoolean(
+          body.adoptExisting,
+          first.adoptExisting,
+          "\u63A5\u7BA1\u5DF2\u6709\u8BB0\u5F55\u5F00\u5173"
+        );
+        const types = mode === "v4" ? ["A"] : mode === "v6" ? ["AAAA"] : ["A", "AAAA"];
+        const oldByKey = new Map(
+          groupItems.map((record) => [recordKey(record.domain, record.type, record.nodeUuid), record])
+        );
+        const nextGroupRecords = [];
+        for (const domain of domains) {
+          for (const type of types) {
+            const key = recordKey(domain, type, first.nodeUuid);
+            const previous = oldByKey.get(key);
+            nextGroupRecords.push(
+              normalizeRecord(
+                {
+                  ...previous,
+                  groupId,
+                  domain,
+                  type,
+                  nodeUuid: first.nodeUuid,
+                  ttl,
+                  proxied,
+                  enabled,
+                  intervalMinutes,
+                  adoptExisting
+                },
+                previous
+              )
+            );
+          }
+        }
+        const outsideKeys = new Set(
+          records.filter((record) => record.groupId !== groupId).map((record) => recordKey(record.domain, record.type, record.nodeUuid))
+        );
+        const overlaps = nextGroupRecords.filter(
+          (record) => outsideKeys.has(recordKey(record.domain, record.type, record.nodeUuid))
+        );
+        if (overlaps.length) {
+          throw new PluginError(
+            `\u76EE\u6807\u5DF2\u88AB\u5176\u4ED6\u89C4\u5219\u7EC4\u5360\u7528\uFF1A${overlaps.slice(0, 5).map((record) => `${record.domain} ${record.type}`).join("\u3001")}`,
+            409
+          );
+        }
+        const nextIds = new Set(nextGroupRecords.map((record) => record.id));
+        const removedIds = groupItems.filter((record) => !nextIds.has(record.id)).map((record) => record.id);
+        const nextRecords = records.filter((record) => record.groupId !== groupId).concat(nextGroupRecords);
+        storage2.saveRecords(nextRecords);
+        if (removedIds.length) engine2.removeStatuses(removedIds);
+        storage2.appendLog({
+          level: "info",
+          action: "group-update",
+          message: `\u66F4\u65B0\u8282\u70B9\u89C4\u5219\u7EC4\uFF0C\u73B0\u6709 ${nextGroupRecords.length} \u6761 DNS \u76EE\u6807${removedIds.length ? `\uFF0C\u79FB\u9664 ${removedIds.length} \u6761\u76EE\u6807\u89C4\u5219` : ""}\u3002`
+        });
+        setNoStore(res);
+        (0, import_plugin_sdk.jsonResponse)(res, {
+          ok: true,
+          group: groupRecords(nextGroupRecords)[0],
+          removedTargets: removedIds.length
         });
       } catch (error) {
         fail(res, error);
@@ -1394,42 +1705,45 @@
       try {
         requireCsrf(req, csrf2);
         const body = bodyOf(req);
-        const ids = parseIds(body.ids);
+        const groupIds = parseIds(body.ids);
         const action = String(body.action || "");
-        const idSet = new Set(ids);
+        const idSet = new Set(groupIds);
         const records = storage2.loadRecords();
+        const selectedGroups = groupRecords(records).filter((group) => idSet.has(group.id));
+        if (!selectedGroups.length) throw new PluginError("\u6240\u9009\u89C4\u5219\u7EC4\u4E0D\u5B58\u5728\u3002", 404);
+        const recordIds = selectedGroups.flatMap((group) => group.recordIds);
         if (action === "enable" || action === "disable") {
           ensureIdle(engine2);
           const enabled = action === "enable";
           const updated = records.map(
-            (record) => idSet.has(record.id) ? { ...record, enabled, updatedAt: nowIso() } : record
+            (record) => idSet.has(record.groupId) ? { ...record, enabled, updatedAt: nowIso() } : record
           );
           storage2.saveRecords(updated);
           storage2.appendLog({
             level: "info",
             action: enabled ? "bulk-enable" : "bulk-disable",
-            message: `${enabled ? "\u542F\u7528" : "\u505C\u7528"} ${ids.length} \u6761\u89C4\u5219\u3002`
+            message: `${enabled ? "\u542F\u7528" : "\u505C\u7528"} ${selectedGroups.length} \u4E2A\u8282\u70B9\u89C4\u5219\u7EC4\u3002`
           });
           setNoStore(res);
-          (0, import_plugin_sdk.jsonResponse)(res, { ok: true, affected: ids.length });
+          (0, import_plugin_sdk.jsonResponse)(res, { ok: true, affectedGroups: selectedGroups.length });
           return;
         }
         if (action === "delete") {
           ensureIdle(engine2);
-          const remaining = records.filter((record) => !idSet.has(record.id));
+          const remaining = records.filter((record) => !idSet.has(record.groupId));
           storage2.saveRecords(remaining);
-          engine2.removeStatuses(ids);
+          engine2.removeStatuses(recordIds);
           storage2.appendLog({
             level: "warning",
             action: "bulk-delete",
-            message: `\u5220\u9664 ${records.length - remaining.length} \u6761\u89C4\u5219\uFF0CCloudflare DNS \u8BB0\u5F55\u4FDD\u7559\u3002`
+            message: `\u5220\u9664 ${selectedGroups.length} \u4E2A\u8282\u70B9\u89C4\u5219\u7EC4\uFF0CCloudflare DNS \u8BB0\u5F55\u4FDD\u7559\u3002`
           });
           setNoStore(res);
-          (0, import_plugin_sdk.jsonResponse)(res, { ok: true, affected: records.length - remaining.length });
+          (0, import_plugin_sdk.jsonResponse)(res, { ok: true, affectedGroups: selectedGroups.length });
           return;
         }
         if (action === "sync") {
-          const job = engine2.start(ids, true);
+          const job = engine2.start(recordIds, true);
           setNoStore(res);
           (0, import_plugin_sdk.jsonResponse)(res, { ok: true, job });
           return;
@@ -1444,8 +1758,14 @@
       try {
         requireCsrf(req, csrf2);
         const body = bodyOf(req);
-        const ids = Array.isArray(body.ids) ? parseIds(body.ids) : void 0;
-        const job = engine2.start(ids, body.force === false ? false : true);
+        const groupIds = Array.isArray(body.groupIds) ? parseIds(body.groupIds) : Array.isArray(body.ids) ? parseIds(body.ids) : void 0;
+        let recordIds;
+        if (groupIds) {
+          const selected = new Set(groupIds);
+          recordIds = groupRecords(storage2.loadRecords()).filter((group) => selected.has(group.id)).flatMap((group) => group.recordIds);
+          if (!recordIds.length) throw new PluginError("\u6240\u9009\u89C4\u5219\u7EC4\u4E0D\u5B58\u5728\u3002", 404);
+        }
+        const job = engine2.start(recordIds, body.force === false ? false : true);
         setNoStore(res);
         (0, import_plugin_sdk.jsonResponse)(res, { ok: true, job });
       } catch (error) {
@@ -1485,6 +1805,7 @@
     email: "",
     apiKey: "",
     notify: false,
+    paused: false,
     intervalMinutes: 1,
     updatedAt: ""
   };
@@ -1533,6 +1854,7 @@
         email: typeof raw.email === "string" ? raw.email : "",
         apiKey: typeof raw.apiKey === "string" ? raw.apiKey : "",
         notify: Boolean(raw.notify),
+        paused: Boolean(raw.paused),
         intervalMinutes: Number(raw.intervalMinutes) || 1,
         updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : ""
       };
@@ -1543,9 +1865,28 @@
     loadRecords() {
       const raw = this.readJson("records.json", []);
       if (!Array.isArray(raw)) return [];
-      return raw.filter((record) => {
+      const records = raw.filter((record) => {
         return Boolean(record) && typeof record === "object" && typeof record.id === "string" && typeof record.domain === "string" && (record.type === "A" || record.type === "AAAA") && typeof record.nodeUuid === "string";
       });
+      let migrated = false;
+      for (const record of records) {
+        if (typeof record.groupId === "string" && /^[a-zA-Z0-9-]{8,64}$/.test(record.groupId)) {
+          continue;
+        }
+        const legacyKey = [
+          "legacy",
+          record.nodeUuid,
+          record.ttl,
+          Boolean(record.proxied),
+          Boolean(record.enabled),
+          record.intervalMinutes,
+          Boolean(record.adoptExisting)
+        ].join("|");
+        record.groupId = stableId(legacyKey);
+        migrated = true;
+      }
+      if (migrated) this.saveRecords(records);
+      return records;
     }
     saveRecords(records) {
       this.writeJson("records.json", records);
@@ -1626,12 +1967,13 @@
       };
     }).filter((node) => node.uuid).sort((left, right) => left.name.localeCompare(right.name));
   }
-  async function notify(message) {
+  async function notify(payload) {
     await import_plugin_sdk2.server.call("admin:sendNotification", {
       event: {
         event: "DDNS Plus",
-        message,
-        time: nowIso()
+        message: payload.message,
+        time: nowIso(),
+        clients: payload.clients.map((uuid) => ({ uuid }))
       }
     });
   }

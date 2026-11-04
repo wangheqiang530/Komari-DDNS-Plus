@@ -2,7 +2,7 @@ import { definePlugin, server } from "@komari-monitor/plugin-sdk";
 import { SyncEngine } from "./ddns";
 import { registerRoutes } from "./routes";
 import { Storage } from "./storage";
-import { NodeInfo } from "./types";
+import { NodeInfo, NotificationPayload } from "./types";
 import { errorMessage, makeId, nowIso, redact } from "./util";
 
 const storage = new Storage(__storageDir__);
@@ -63,12 +63,13 @@ async function getNodes(uuids?: string[]): Promise<NodeInfo[]> {
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
-async function notify(message: string): Promise<void> {
+async function notify(payload: NotificationPayload): Promise<void> {
   await server.call("admin:sendNotification", {
     event: {
       event: "DDNS Plus",
-      message,
+      message: payload.message,
       time: nowIso(),
+      clients: payload.clients.map((uuid) => ({ uuid })),
     },
   });
 }

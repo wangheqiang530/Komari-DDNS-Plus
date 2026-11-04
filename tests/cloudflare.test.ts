@@ -13,14 +13,14 @@ describe("Cloudflare client", () => {
     const fetcher = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
-        jsonResponse({ success: true, result: { status: "active" } }),
-      )
-      .mockResolvedValueOnce(
         jsonResponse({
           success: true,
           result: [{ id: "zone-1", name: "example.com", status: "active" }],
           result_info: { total_pages: 1 },
         }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({ success: true, result: [] }),
       );
     const client = createCloudflareClient(
       {
@@ -33,6 +33,10 @@ describe("Cloudflare client", () => {
     );
     const result = await client.test();
     expect(result.zoneCount).toBe(1);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(String(fetcher.mock.calls[0][0])).toContain("/zones?");
+    expect(String(fetcher.mock.calls[0][0])).not.toContain("/user/tokens/verify");
+    expect(String(fetcher.mock.calls[1][0])).toContain("/dns_records?");
     const headers = fetcher.mock.calls[0][1]?.headers as Record<string, string>;
     expect(headers.Authorization).toBe("Bearer " + "t".repeat(40));
   });
@@ -89,6 +93,63 @@ describe("Cloudflare client", () => {
       status: 400,
       code: 6003,
     });
+  });
+
+  it("reports missing Zone read permission for API tokens", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse(
+        {
+          success: false,
+          errors: [{ code: 9109, message: "Unauthorized" }],
+        },
+        403,
+      ),
+    );
+    const client = createCloudflareClient(
+      {
+        authMode: "token",
+        token: "t".repeat(40),
+        email: "",
+        apiKey: "",
+      },
+      fetcher,
+    );
+    const error = await client.test().catch((caught) => caught);
+    expect(error).toBeInstanceOf(CloudflareError);
+    expect(error.message).toContain("Zone > Zone > Read");
+  });
+
+  it("reports missing DNS permission for API tokens", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          success: true,
+          result: [{ id: "zone-1", name: "example.com", status: "active" }],
+          result_info: { total_pages: 1 },
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            success: false,
+            errors: [{ code: 9109, message: "Unauthorized" }],
+          },
+          403,
+        ),
+      );
+    const client = createCloudflareClient(
+      {
+        authMode: "token",
+        token: "t".repeat(40),
+        email: "",
+        apiKey: "",
+      },
+      fetcher,
+    );
+    const error = await client.test().catch((caught) => caught);
+    expect(error).toBeInstanceOf(CloudflareError);
+    expect(error.message).toContain("Zone > DNS > Edit");
   });
 
   it("selects the longest matching zone", async () => {

@@ -3,18 +3,21 @@
 
   var API_BASE = "/ddns-plus";
   var state = {
-    settings: null,
+    settings: {},
     records: [],
+    groups: [],
     statuses: {},
     sync: { running: false, total: 0, completed: 0, changed: 0, skipped: 0, errors: 0 },
     csrf: "",
     nodes: [],
-    selectedRecords: new Set(),
+    selectedGroups: new Set(),
+    expandedGroups: new Set(),
     composerNodes: new Set(),
     mode: "dual",
     authMode: "token",
     activePanel: "records",
     composerOpen: false,
+    editingGroupId: null,
     toastTimer: null,
   };
 
@@ -33,23 +36,24 @@
     plug: '<path d="M12 22v-5M9 7V2M15 7V2M6 7h12v4a6 6 0 0 1-12 0V7Z"/>',
     check: '<path d="m20 6-11 11-5-5"/>',
     globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
-    cloud: '<path d="M17.5 19H7a5 5 0 1 1 1.6-9.8A7 7 0 0 1 22 12a4 4 0 0 1-4.5 7Z"/>',
     edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+    chevron: '<path d="m9 18 6-6-6-6"/>',
     alert: '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/>',
   };
 
   function iconSvg(name) {
-    return (
-      '<svg viewBox="0 0 24 24" aria-hidden="true">' +
-      (ICONS[name] || ICONS.alert) +
-      "</svg>"
-    );
+    return '<svg viewBox="0 0 24 24" aria-hidden="true">' + (ICONS[name] || ICONS.alert) + "</svg>";
   }
 
   function hydrateIcons(root) {
     (root || document).querySelectorAll("[data-icon]").forEach(function (node) {
       node.innerHTML = iconSvg(node.getAttribute("data-icon"));
     });
+  }
+
+  function setButtonIcon(button, name) {
+    var holder = button.querySelector("[data-icon]");
+    if (holder) holder.innerHTML = iconSvg(name);
   }
 
   function el(tag, className, text) {
@@ -70,7 +74,7 @@
     clearTimeout(state.toastTimer);
     state.toastTimer = setTimeout(function () {
       toast.className = "toast";
-    }, 3600);
+    }, 3800);
   }
 
   function formatTime(value) {
@@ -106,41 +110,8 @@
     return labels[Number(value)] || value + " 秒";
   }
 
-  function statusInfo(record) {
-    var status = state.statuses[record.id] || {};
-    var value = !record.enabled ? "disabled" : status.state || "pending";
-    var labels = {
-      success: "正常",
-      error: "失败",
-      skipped: "已跳过",
-      disabled: "已停用",
-      pending: "待同步",
-      running: "同步中",
-    };
-    return {
-      state: value,
-      label: labels[value] || "待同步",
-      error: status.lastError || "",
-    };
-  }
-
-  function logLevelLabel(value) {
-    return { success: "成功", error: "错误", warning: "警告", info: "信息" }[value] || value || "—";
-  }
-
-  function logActionLabel(value) {
-    return {
-      update: "更新",
-      create: "创建",
-      sync: "同步",
-      "batch-add": "批量添加",
-      "bulk-enable": "批量启用",
-      "bulk-disable": "批量停用",
-      "bulk-delete": "批量删除",
-      settings: "设置",
-      schedule: "调度",
-      notify: "通知",
-    }[value] || value || "—";
+  function modeLabel(mode) {
+    return mode === "v4" ? "IPv4" : mode === "v6" ? "IPv6" : "IPv4 + IPv6";
   }
 
   function nodeName(uuid) {
@@ -152,7 +123,7 @@
 
   function hasCredentials(settings) {
     if (!settings) return false;
-    return settings.authMode === "token" ? settings.hasToken : Boolean(settings.email && settings.hasApiKey);
+    return settings.authMode === "token" ? Boolean(settings.hasToken) : Boolean(settings.email && settings.hasApiKey);
   }
 
   function parseDomainText(value) {
@@ -177,6 +148,105 @@
     return state.mode === "dual" ? 2 : 1;
   }
 
+  function groupRecords(group) {
+    if (group && Array.isArray(group.recordIds)) {
+      var ids = new Set(group.recordIds);
+      return state.records.filter(function (record) {
+        return ids.has(record.id);
+      });
+    }
+    return state.records.filter(function (record) {
+      return group && record.groupId === group.id;
+    });
+  }
+
+  function recordStatus(record) {
+    var status = state.statuses[record.id] || {};
+    var value = !record.enabled ? "disabled" : status.state || "pending";
+    var labels = {
+      success: "正常",
+      error: "失败",
+      skipped: "已跳过",
+      disabled: "已停用",
+      pending: "待同步",
+      running: "同步中",
+    };
+    return {
+      state: value,
+      label: labels[value] || "待同步",
+      error: status.lastError || "",
+      lastCheckedAt: status.lastCheckedAt || "",
+      currentIp: status.currentIp || "",
+    };
+  }
+
+  function groupStatus(group) {
+    var records = groupRecords(group);
+    if (!group.enabled) return { state: "disabled", label: "已停用", total: records.length };
+    if (state.sync.running) return { state: "running", label: "同步中", total: records.length };
+    var counts = { success: 0, error: 0, skipped: 0, pending: 0 };
+    records.forEach(function (record) {
+      var value = recordStatus(record).state;
+      if (counts[value] !== undefined) counts[value] += 1;
+    });
+    if (counts.error) {
+      return { state: "error", label: "失败 " + counts.error + "/" + records.length, total: records.length, counts: counts };
+    }
+    if (counts.skipped) {
+      return { state: "skipped", label: "跳过 " + counts.skipped + "/" + records.length, total: records.length, counts: counts };
+    }
+    if (counts.success === records.length && records.length) {
+      return { state: "success", label: "正常 " + counts.success + "/" + records.length, total: records.length, counts: counts };
+    }
+    return { state: "pending", label: "待同步", total: records.length, counts: counts };
+  }
+
+  function groupLastSync(group) {
+    var latest = "";
+    groupRecords(group).forEach(function (record) {
+      var value = (state.statuses[record.id] || {}).lastCheckedAt || "";
+      if (value && value > latest) latest = value;
+    });
+    return latest;
+  }
+
+  function deriveGroups(records) {
+    var map = {};
+    records.forEach(function (record) {
+      var id = record.groupId || record.id;
+      if (!map[id]) map[id] = [];
+      map[id].push(record);
+    });
+    return Object.keys(map).map(function (id) {
+      var items = map[id];
+      var domains = [];
+      var seen = new Set();
+      var types = new Set();
+      items.forEach(function (item) {
+        if (!seen.has(item.domain)) {
+          seen.add(item.domain);
+          domains.push(item.domain);
+        }
+        types.add(item.type);
+      });
+      var first = items[0];
+      return {
+        id: id,
+        nodeUuid: first.nodeUuid,
+        domains: domains,
+        mode: types.has("A") && types.has("AAAA") ? "dual" : types.has("AAAA") ? "v6" : "v4",
+        ttl: first.ttl,
+        proxied: first.proxied,
+        enabled: first.enabled,
+        intervalMinutes: first.intervalMinutes,
+        adoptExisting: first.adoptExisting,
+        recordIds: items.map(function (item) { return item.id; }),
+        createdAt: first.createdAt || "",
+        updatedAt: first.updatedAt || "",
+      };
+    });
+  }
+
   function api(path, options) {
     options = options || {};
     var method = options.method || "GET";
@@ -196,9 +266,7 @@
           return {};
         })
         .then(function (data) {
-          if (!response.ok) {
-            throw new Error(data.error || "请求失败（HTTP " + response.status + "）");
-          }
+          if (!response.ok) throw new Error(data.error || "请求失败（HTTP " + response.status + "）");
           return data;
         });
     });
@@ -207,26 +275,28 @@
   function applyState(data) {
     state.settings = data.settings || {};
     state.records = Array.isArray(data.records) ? data.records : [];
+    state.groups = Array.isArray(data.groups) ? data.groups : deriveGroups(state.records);
     state.statuses = data.statuses || {};
     state.sync = data.sync || state.sync;
     state.csrf = data.csrf || state.csrf;
-    var existing = new Set(
-      state.records.map(function (record) {
-        return record.id;
-      }),
-    );
-    Array.from(state.selectedRecords).forEach(function (id) {
-      if (!existing.has(id)) state.selectedRecords.delete(id);
+    var groupIds = new Set(state.groups.map(function (group) { return group.id; }));
+    Array.from(state.selectedGroups).forEach(function (id) {
+      if (!groupIds.has(id)) state.selectedGroups.delete(id);
+    });
+    Array.from(state.expandedGroups).forEach(function (id) {
+      if (!groupIds.has(id)) state.expandedGroups.delete(id);
     });
   }
 
   function renderHeader() {
     var pill = byId("sync-state");
     var job = state.sync || {};
-    if (job.running) {
+    if (state.settings.paused && !job.running) {
+      pill.className = "status-pill status-paused";
+      pill.textContent = "计划同步已暂停";
+    } else if (job.running) {
       pill.className = "status-pill status-running";
-      pill.textContent =
-        "同步中 " + Number(job.completed || 0) + "/" + Number(job.total || 0);
+      pill.textContent = "同步中 " + Number(job.completed || 0) + "/" + Number(job.total || 0);
     } else if (job.errors > 0) {
       pill.className = "status-pill status-error";
       pill.textContent = "上次同步有失败";
@@ -237,17 +307,18 @@
       pill.className = "status-pill status-idle";
       pill.textContent = "待命";
     }
+    var pauseButton = byId("btn-toggle-pause");
+    byId("pause-label").textContent = state.settings.paused ? "恢复同步" : "暂停同步";
+    setButtonIcon(pauseButton, state.settings.paused ? "play" : "pause");
     var progress = byId("sync-progress");
     if (job.running) {
       progress.hidden = false;
       progress.textContent =
-        "正在同步 " +
-        Number(job.completed || 0) +
-        "/" +
-        Number(job.total || 0) +
-        "，已变更 " +
-        Number(job.changed || 0) +
-        " 条";
+        "正在同步 " + Number(job.completed || 0) + "/" + Number(job.total || 0) +
+        "，已变更 " + Number(job.changed || 0) + " 条";
+    } else if (state.settings.paused) {
+      progress.hidden = false;
+      progress.textContent = "计划同步已暂停，手动同步仍然可用。";
     } else if (job.message) {
       progress.hidden = false;
       progress.textContent = job.message;
@@ -257,10 +328,12 @@
     }
     var busy = Boolean(job.running);
     byId("btn-sync-all").disabled = busy;
-    byId("btn-create-batch").disabled = busy;
+    byId("btn-add").disabled = busy;
+    byId("btn-create-batch").disabled = busy || byId("btn-create-batch").disabled;
     byId("btn-test").disabled = busy;
     byId("btn-save-settings").disabled = busy;
     byId("btn-bulk-sync").disabled = busy;
+    if (!busy) updatePreview();
   }
 
   function renderNodes() {
@@ -270,14 +343,13 @@
     var visible = state.nodes.filter(function (node) {
       return !search || (node.name + " " + node.uuid).toLowerCase().indexOf(search) >= 0;
     });
-    if (!visible.length) {
-      list.appendChild(el("div", "empty-inline", "没有匹配的节点"));
-    }
+    if (!visible.length) list.appendChild(el("div", "empty-inline", "没有匹配的节点"));
     visible.forEach(function (node) {
       var label = el("label", "node-option");
       var input = el("input");
       input.type = "checkbox";
       input.checked = state.composerNodes.has(node.uuid);
+      input.disabled = Boolean(state.editingGroupId);
       input.addEventListener("change", function () {
         if (input.checked) state.composerNodes.add(node.uuid);
         else state.composerNodes.delete(node.uuid);
@@ -288,13 +360,7 @@
       name.appendChild(el("span", "online-dot" + (node.online ? "" : " offline")));
       name.appendChild(document.createTextNode(node.name || node.uuid));
       copy.appendChild(name);
-      copy.appendChild(
-        el(
-          "small",
-          "",
-          [node.ipv4 || "无 IPv4", node.ipv6 || "无 IPv6"].join(" · "),
-        ),
-      );
+      copy.appendChild(el("small", "", [node.ipv4 || "无 IPv4", node.ipv6 || "无 IPv6"].join(" · ")));
       label.appendChild(input);
       label.appendChild(copy);
       list.appendChild(label);
@@ -302,113 +368,195 @@
     byId("node-count").textContent = "已选 " + state.composerNodes.size + " 台";
   }
 
-  function visibleRecords() {
+  function visibleGroups() {
     var search = String(byId("filter-search").value || "").trim().toLowerCase();
     var filter = byId("filter-status").value;
-    return state.records.filter(function (record) {
-      var status = statusInfo(record).state;
-      if (filter && status !== filter) return false;
-      if (!search) return true;
-      return (
-        (record.domain + " " + nodeName(record.nodeUuid) + " " + record.type)
-          .toLowerCase()
-          .indexOf(search) >= 0
-      );
-    });
+    return state.groups
+      .filter(function (group) {
+        if (filter && groupStatus(group).state !== filter) return false;
+        if (!search) return true;
+        return (
+          (nodeName(group.nodeUuid) + " " + group.domains.join(" ") + " " + modeLabel(group.mode))
+            .toLowerCase()
+            .indexOf(search) >= 0
+        );
+      })
+      .sort(function (left, right) {
+        return (
+          nodeName(left.nodeUuid).localeCompare(nodeName(right.nodeUuid), "zh-CN") ||
+          left.createdAt.localeCompare(right.createdAt)
+        );
+      });
   }
 
-  function renderRecords() {
-    var body = byId("records-body");
+  function renderGroups() {
+    var body = byId("groups-body");
     body.replaceChildren();
-    var records = visibleRecords();
-    records.forEach(function (record) {
-      var status = statusInfo(record);
-      var node = state.nodes.find(function (item) {
-        return item.uuid === record.nodeUuid;
-      });
-      var tr = el("tr");
+    var groups = visibleGroups();
+    groups.forEach(function (group) {
+      var status = groupStatus(group);
+      var node = state.nodes.find(function (item) { return item.uuid === group.nodeUuid; });
+      var expanded = state.expandedGroups.has(group.id);
+      var tr = el("tr", "group-row" + (expanded ? " expanded" : ""));
 
       var checkCell = el("td", "check-cell");
       var check = el("input");
       check.type = "checkbox";
-      check.checked = state.selectedRecords.has(record.id);
-      check.setAttribute("aria-label", "选择 " + record.domain);
+      check.checked = state.selectedGroups.has(group.id);
+      check.setAttribute("aria-label", "选择 " + nodeName(group.nodeUuid) + " 规则组");
+      check.addEventListener("click", function (event) { event.stopPropagation(); });
       check.addEventListener("change", function () {
-        if (check.checked) state.selectedRecords.add(record.id);
-        else state.selectedRecords.delete(record.id);
+        if (check.checked) state.selectedGroups.add(group.id);
+        else state.selectedGroups.delete(group.id);
         renderBulkBar();
-        renderRecords();
+        renderGroups();
       });
       checkCell.appendChild(check);
       tr.appendChild(checkCell);
 
-      tr.appendChild(el("td", "domain-cell", record.domain));
-      var typeCell = el("td");
-      typeCell.appendChild(el("span", "type-badge", record.type));
-      tr.appendChild(typeCell);
-
       var nodeCell = el("td", "node-cell");
-      nodeCell.appendChild(
-        el("span", "online-dot" + (node && node.online ? "" : " offline")),
-      );
-      nodeCell.appendChild(document.createTextNode(nodeName(record.nodeUuid)));
+      var nodeInner = el("div", "node-cell-inner");
+      var expand = el("button", "expand-button" + (expanded ? " expanded" : ""));
+      expand.type = "button";
+      expand.title = expanded ? "收起详情" : "展开详情";
+      expand.setAttribute("aria-label", expand.title);
+      expand.innerHTML = iconSvg("chevron");
+      expand.addEventListener("click", function (event) {
+        event.stopPropagation();
+        toggleGroup(group.id);
+      });
+      nodeInner.appendChild(expand);
+      nodeInner.appendChild(el("span", "online-dot" + (node && node.online ? "" : " offline")));
+      nodeInner.appendChild(el("span", "node-cell-name", nodeName(group.nodeUuid)));
+      nodeCell.appendChild(nodeInner);
       tr.appendChild(nodeCell);
 
-      var statusData = state.statuses[record.id] || {};
-      tr.appendChild(el("td", "ip-cell mono", statusData.currentIp || "—"));
-      tr.appendChild(el("td", "", ttlLabel(record.ttl)));
-      tr.appendChild(el("td", "", record.proxied ? "已代理" : "未代理"));
+      var modeCell = el("td");
+      modeCell.appendChild(el("span", "mode-badge", modeLabel(group.mode)));
+      tr.appendChild(modeCell);
 
-      var stateCell = el("td");
-      var badge = el("span", "badge " + status.state, status.label);
-      if (status.error) badge.title = status.error;
-      stateCell.appendChild(badge);
-      if (status.error) {
-        var error = el("div", "row-error", status.error);
-        error.title = status.error;
-        stateCell.appendChild(error);
-      }
-      tr.appendChild(stateCell);
-      tr.appendChild(el("td", "", formatTime(statusData.lastCheckedAt)));
+      var domainsCell = el("td");
+      var domainText = el("div", "group-domain-list");
+      domainText.appendChild(document.createTextNode(group.domains[0] || "—"));
+      if (group.domains.length > 1) domainText.appendChild(el("small", "", "  +" + (group.domains.length - 1)));
+      domainsCell.appendChild(domainText);
+      tr.appendChild(domainsCell);
 
-      var actionCell = el("td", "action-cell");
+      tr.appendChild(el("td", "", ttlLabel(group.ttl)));
+      tr.appendChild(el("td", "", group.proxied ? "已代理" : "未代理"));
+
+      var statusCell = el("td");
+      statusCell.appendChild(el("span", "badge " + status.state, status.label));
+      tr.appendChild(statusCell);
+      tr.appendChild(el("td", "", formatTime(groupLastSync(group))));
+
+      var actionsCell = el("td", "action-cell");
       var actions = el("div", "row-actions");
-      actions.appendChild(rowAction("play", "立即同步", function () {
-        runBulk("sync", [record.id]);
+      actions.appendChild(rowAction("play", "立即同步", function (event) {
+        event.stopPropagation();
+        syncGroup(group.id);
       }));
-      actions.appendChild(
-        rowAction(record.enabled ? "pause" : "power", record.enabled ? "停用" : "启用", function () {
-          runBulk(record.enabled ? "disable" : "enable", [record.id]);
-        }),
-      );
-      actions.appendChild(
-        rowAction("trash", "删除规则", function () {
-          runBulk("delete", [record.id]);
-        }, true),
-      );
-      actionCell.appendChild(actions);
-      tr.appendChild(actionCell);
+      actions.appendChild(rowAction(group.enabled ? "pause" : "power", group.enabled ? "停用" : "启用", function (event) {
+        event.stopPropagation();
+        runBulk(group.enabled ? "disable" : "enable", [group.id]);
+      }));
+      actions.appendChild(rowAction("edit", "编辑规则", function (event) {
+        event.stopPropagation();
+        openEditComposer(group.id);
+      }));
+      actions.appendChild(rowAction("trash", "删除规则组", function (event) {
+        event.stopPropagation();
+        runBulk("delete", [group.id]);
+      }, true));
+      actionsCell.appendChild(actions);
+      tr.appendChild(actionsCell);
+      tr.addEventListener("click", function (event) {
+        if (event.target.closest("button, input, label")) return;
+        toggleGroup(group.id);
+      });
       body.appendChild(tr);
+
+      if (expanded) body.appendChild(renderGroupDetail(group, node));
     });
 
     var empty = byId("empty-records");
-    empty.hidden = records.length > 0;
-    if (!records.length) {
-      empty.querySelector("h3").textContent = state.records.length ? "没有匹配的规则" : "还没有 DDNS 规则";
-      empty.querySelector("p").textContent = state.records.length
+    empty.hidden = groups.length > 0;
+    if (!groups.length) {
+      empty.querySelector("h3").textContent = state.groups.length ? "没有匹配的节点规则" : "还没有节点规则";
+      empty.querySelector("p").textContent = state.groups.length
         ? "调整筛选条件后重试。"
-        : "先配置 Cloudflare 凭据，然后批量添加域名。";
+        : "先配置 Cloudflare 凭据，然后为节点创建规则组。";
     }
-    var visibleIds = records.map(function (record) {
-      return record.id;
-    });
-    var allChecked =
+    var visibleIds = groups.map(function (group) { return group.id; });
+    byId("select-all").checked =
       visibleIds.length > 0 &&
-      visibleIds.every(function (id) {
-        return state.selectedRecords.has(id);
-      });
-    byId("select-all").checked = allChecked;
+      visibleIds.every(function (id) { return state.selectedGroups.has(id); });
     renderBulkBar();
+  }
+
+  function renderGroupDetail(group, node) {
+    var tr = el("tr", "detail-row");
+    var cell = el("td");
+    cell.colSpan = 9;
+    var detail = el("div", "group-detail");
+    var heading = el("div", "detail-heading");
+    var title = el("div");
+    title.appendChild(el("strong", "", (node ? node.name : nodeName(group.nodeUuid)) + " · " + modeLabel(group.mode)));
+    title.appendChild(el("span", "", "  " + group.domains.length + " 个域名，每 " + group.intervalMinutes + " 分钟检查"));
+    heading.appendChild(title);
+    detail.appendChild(heading);
+
+    var table = el("table", "target-table");
+    var thead = el("thead");
+    var headRow = el("tr");
+    ["域名", "类型", "当前 IP", "状态", "上次同步"].forEach(function (label) {
+      headRow.appendChild(el("th", "", label));
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    var tbody = el("tbody");
+    var records = groupRecords(group);
+    records.forEach(function (record) {
+      var status = recordStatus(record);
+      var row = el("tr");
+      row.appendChild(el("td", "target-domain", record.domain));
+      var typeCell = el("td");
+      typeCell.appendChild(el("span", "type-badge", record.type));
+      row.appendChild(typeCell);
+      row.appendChild(el("td", "mono", status.currentIp || "—"));
+      var stateCell = el("td");
+      stateCell.appendChild(el("span", "badge " + status.state, status.label));
+      if (status.error) {
+        var error = el("div", "target-error", status.error);
+        error.title = status.error;
+        stateCell.appendChild(error);
+      }
+      row.appendChild(stateCell);
+      row.appendChild(el("td", "", formatTime(status.lastCheckedAt)));
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    detail.appendChild(table);
+
+    var actions = el("div", "detail-actions");
+    actions.appendChild(textButton("edit", "编辑规则", function () { openEditComposer(group.id); }));
+    actions.appendChild(textButton("play", "立即同步", function () { syncGroup(group.id); }));
+    actions.appendChild(textButton(group.enabled ? "pause" : "power", group.enabled ? "停用" : "启用", function () {
+      runBulk(group.enabled ? "disable" : "enable", [group.id]);
+    }));
+    actions.appendChild(textButton("trash", "删除规则组", function () { runBulk("delete", [group.id]); }, true));
+    detail.appendChild(actions);
+    cell.appendChild(detail);
+    tr.appendChild(cell);
+    return tr;
+  }
+
+  function textButton(icon, label, handler, danger) {
+    var button = el("button", "button " + (danger ? "danger" : "secondary"));
+    button.type = "button";
+    button.innerHTML = iconSvg(icon) + "<span>" + label + "</span>";
+    button.addEventListener("click", handler);
+    return button;
   }
 
   function rowAction(icon, label, handler, danger) {
@@ -422,10 +570,9 @@
   }
 
   function renderBulkBar() {
-    var count = state.selectedRecords.size;
-    var bar = byId("bulk-bar");
-    bar.hidden = count === 0;
-    byId("bulk-count").textContent = "已选 " + count + " 条";
+    var count = state.selectedGroups.size;
+    byId("bulk-bar").hidden = count === 0;
+    byId("bulk-count").textContent = "已选 " + count + " 个节点规则组";
   }
 
   function renderSettings() {
@@ -442,7 +589,7 @@
     byId("api-key").value = "";
     byId("token-hint").textContent = settings.hasToken
       ? "已保存 API Token；留空保存会保留当前 Token。"
-      : "建议使用 Zone.Zone:Read 和 Zone.DNS:Edit 权限。";
+      : "支持用户 API Token 和 Account API Token。需要 Zone > Zone > Read 与 Zone > DNS > Edit。";
     byId("key-hint").textContent = settings.hasApiKey
       ? "已保存 Global API Key；留空保存会保留当前 Key。"
       : "这不是 API Token，也不是 Origin CA Key。";
@@ -466,15 +613,10 @@
       byId("btn-create-batch").disabled = true;
       return;
     }
+    var verb = state.editingGroupId ? "更新" : "创建";
     text.textContent =
-      domains.length +
-      " 个域名 × " +
-      state.composerNodes.size +
-      " 台节点 × " +
-      selectedTypeCount() +
-      " 种地址 = " +
-      count +
-      " 条记录";
+      verb + " " + domains.length + " 个域名 × " + state.composerNodes.size +
+      " 台节点 × " + selectedTypeCount() + " 种地址 = " + count + " 条 DNS 目标";
     text.className = "preview-text" + (count > 1000 ? " preview-over" : "");
     byId("btn-create-batch").disabled = count > 1000 || Boolean(state.sync.running);
   }
@@ -490,7 +632,14 @@
   }
 
   function resetComposer() {
+    state.editingGroupId = null;
     state.composerNodes.clear();
+    byId("composer").classList.remove("editing");
+    byId("node-field").hidden = false;
+    byId("edit-node-lock").hidden = true;
+    byId("composer-title").textContent = "新建节点规则";
+    byId("composer-subtitle").textContent = "每台节点生成一个独立规则组，可重复创建 IPv4 和 IPv6 规则。";
+    byId("btn-create-batch-label").textContent = "创建规则";
     byId("domains").value = "";
     byId("node-search").value = "";
     byId("ttl").value = "1";
@@ -501,6 +650,41 @@
     state.mode = "dual";
     renderNodes();
     renderMode();
+  }
+
+  function openAddComposer() {
+    resetComposer();
+    setComposer(true);
+  }
+
+  function openEditComposer(groupId) {
+    var group = state.groups.find(function (item) { return item.id === groupId; });
+    if (!group) return;
+    state.editingGroupId = groupId;
+    state.composerNodes = new Set([group.nodeUuid]);
+    state.mode = group.mode;
+    byId("composer").classList.add("editing");
+    byId("node-field").hidden = true;
+    byId("edit-node-lock").hidden = false;
+    byId("edit-node-lock").textContent = "当前节点：" + nodeName(group.nodeUuid) + "。编辑时节点不可更改。";
+    byId("composer-title").textContent = "编辑节点规则";
+    byId("composer-subtitle").textContent = "修改域名、模式、TTL、代理和同步间隔；节点保持不变。";
+    byId("btn-create-batch-label").textContent = "保存修改";
+    byId("domains").value = group.domains.join("\n");
+    byId("ttl").value = String(group.ttl);
+    byId("interval").value = String(group.intervalMinutes);
+    byId("proxied").checked = Boolean(group.proxied);
+    byId("adopt-existing").checked = Boolean(group.adoptExisting);
+    byId("ttl").disabled = Boolean(group.proxied);
+    renderNodes();
+    renderMode();
+    setComposer(true);
+  }
+
+  function toggleGroup(groupId) {
+    if (state.expandedGroups.has(groupId)) state.expandedGroups.delete(groupId);
+    else state.expandedGroups.add(groupId);
+    renderGroups();
   }
 
   function switchPanel(name) {
@@ -515,10 +699,9 @@
   function renderAll() {
     renderHeader();
     renderNodes();
-    renderRecords();
+    renderGroups();
     renderSettings();
     renderMode();
-    if (state.activePanel === "logs") refreshLogs();
   }
 
   function loadAll() {
@@ -527,7 +710,12 @@
       state.authMode = state.settings.authMode || "token";
       state.nodes = Array.isArray(values[1]) ? values[1] : [];
       renderAll();
-      if (!hasCredentials(state.settings)) switchPanel("settings");
+      var requested = new URLSearchParams(location.search).get("panel");
+      if (requested === "records" || requested === "settings" || requested === "logs") {
+        switchPanel(requested);
+      } else if (!hasCredentials(state.settings)) {
+        switchPanel("settings");
+      }
     });
   }
 
@@ -536,8 +724,30 @@
       applyState(data);
       renderHeader();
       renderNodes();
-      renderRecords();
+      renderGroups();
     });
+  }
+
+  function logLevelLabel(value) {
+    return { success: "成功", error: "错误", warning: "警告", info: "信息" }[value] || value || "—";
+  }
+
+  function logActionLabel(value) {
+    return {
+      update: "更新",
+      create: "创建",
+      sync: "同步",
+      "batch-add": "批量添加",
+      "group-update": "编辑规则组",
+      "bulk-enable": "批量启用",
+      "bulk-disable": "批量停用",
+      "bulk-delete": "批量删除",
+      pause: "暂停",
+      resume: "恢复",
+      settings: "设置",
+      schedule: "调度",
+      notify: "通知",
+    }[value] || value || "—";
   }
 
   function refreshLogs() {
@@ -551,7 +761,8 @@
           var tr = el("tr");
           tr.appendChild(el("td", "", formatTime(log.at)));
           var levelCell = el("td");
-          levelCell.appendChild(el("span", "badge " + (log.level === "success" ? "success" : log.level === "error" ? "error" : log.level === "warning" ? "skipped" : "pending"), logLevelLabel(log.level)));
+          var levelClass = log.level === "success" ? "success" : log.level === "error" ? "error" : log.level === "warning" ? "skipped" : "pending";
+          levelCell.appendChild(el("span", "badge " + levelClass, logLevelLabel(log.level)));
           tr.appendChild(levelCell);
           tr.appendChild(el("td", "", logActionLabel(log.action)));
           tr.appendChild(el("td", "mono", log.domain || "—"));
@@ -578,10 +789,9 @@
       .then(function (data) {
         state.settings = data.settings;
         renderSettings();
+        renderHeader();
         showToast("设置已保存。", "success");
-        if (hasCredentials(state.settings) && state.activePanel === "settings") {
-          switchPanel("records");
-        }
+        if (hasCredentials(state.settings) && state.activePanel === "settings") switchPanel("records");
       })
       .catch(function (error) {
         showToast(error.message, "error");
@@ -615,7 +825,6 @@
 
   function createBatch() {
     var payload = {
-      nodeUuids: Array.from(state.composerNodes),
       domains: byId("domains").value,
       mode: state.mode,
       ttl: Number(byId("ttl").value),
@@ -624,41 +833,46 @@
       enabled: true,
       adoptExisting: byId("adopt-existing").checked,
     };
+    if (state.editingGroupId) {
+      var group = state.groups.find(function (item) { return item.id === state.editingGroupId; });
+      if (group) payload.enabled = group.enabled;
+      payload.groupId = state.editingGroupId;
+      api("/groups/update", { method: "POST", body: JSON.stringify(payload) })
+        .then(function () {
+          showToast("节点规则组已更新；被移除的目标不会自动删除 Cloudflare 记录。", "success");
+          resetComposer();
+          setComposer(false);
+          refreshState();
+        })
+        .catch(function (error) { showToast(error.message, "error"); });
+      return;
+    }
+    payload.nodeUuids = Array.from(state.composerNodes);
     api("/records/batch", { method: "POST", body: JSON.stringify(payload) })
       .then(function (data) {
-        showToast(
-          "已创建 " + data.added + " 条规则" + (data.skipped ? "，跳过 " + data.skipped + " 条重复规则。" : "。"),
-          "success",
-        );
+        showToast("已创建 " + data.groupsAdded + " 个节点规则组，共 " + data.recordsAdded + " 条 DNS 目标。", "success");
         resetComposer();
         setComposer(false);
         refreshState();
       })
-      .catch(function (error) {
-        showToast(error.message, "error");
-      });
+      .catch(function (error) { showToast(error.message, "error"); });
   }
 
   function runBulk(action, ids) {
-    ids = ids || Array.from(state.selectedRecords);
+    ids = ids || Array.from(state.selectedGroups);
     if (!ids.length) return;
-    if (action === "delete" && !confirm("确定删除选中的规则？Cloudflare DNS 记录会保留。")) return;
-    api("/records/bulk", {
-      method: "POST",
-      body: JSON.stringify({ action: action, ids: ids }),
-    })
+    if (action === "delete" && !confirm("删除选中的节点规则组？Cloudflare DNS 记录会保留。")) return;
+    api("/records/bulk", { method: "POST", body: JSON.stringify({ action: action, ids: ids }) })
       .then(function () {
         if (action === "delete" || action === "enable" || action === "disable") {
-          state.selectedRecords.clear();
+          state.selectedGroups.clear();
           showToast("批量操作已完成。", "success");
         } else {
           showToast("同步任务已启动。", "success");
         }
         refreshState();
       })
-      .catch(function (error) {
-        showToast(error.message, "error");
-      });
+      .catch(function (error) { showToast(error.message, "error"); });
   }
 
   function syncAll() {
@@ -668,55 +882,46 @@
         renderHeader();
         showToast(data.job && data.job.message ? data.job.message : "同步任务已启动。", "success");
       })
-      .catch(function (error) {
-        showToast(error.message, "error");
-      });
+      .catch(function (error) { showToast(error.message, "error"); });
+  }
+
+  function syncGroup(groupId) {
+    api("/sync", { method: "POST", body: JSON.stringify({ groupIds: [groupId], force: true }) })
+      .then(function () {
+        showToast("同步任务已启动。", "success");
+        refreshState();
+      })
+      .catch(function (error) { showToast(error.message, "error"); });
+  }
+
+  function togglePause() {
+    var paused = !state.settings.paused;
+    api("/pause", { method: "POST", body: JSON.stringify({ paused: paused }) })
+      .then(function () {
+        state.settings.paused = paused;
+        renderHeader();
+        showToast(paused ? "计划同步已暂停。" : "计划同步已恢复。", "success");
+      })
+      .catch(function (error) { showToast(error.message, "error"); });
   }
 
   function bind() {
     document.querySelectorAll(".tab").forEach(function (tab) {
-      tab.addEventListener("click", function () {
-        switchPanel(tab.getAttribute("data-panel"));
-      });
+      tab.addEventListener("click", function () { switchPanel(tab.getAttribute("data-panel")); });
     });
     byId("btn-refresh").addEventListener("click", function () {
-      loadAll().then(function () {
-        showToast("已刷新。", "success");
-      }).catch(function (error) {
-        showToast(error.message, "error");
-      });
+      loadAll().then(function () { showToast("已刷新。", "success"); }).catch(function (error) { showToast(error.message, "error"); });
     });
-    byId("btn-add").addEventListener("click", function () {
-      resetComposer();
-      setComposer(true);
-    });
-    byId("btn-empty-add").addEventListener("click", function () {
-      resetComposer();
-      setComposer(true);
-    });
-    byId("btn-cancel-add").addEventListener("click", function () {
-      setComposer(false);
-    });
-    byId("btn-cancel-add-2").addEventListener("click", function () {
-      setComposer(false);
-    });
+    byId("btn-toggle-pause").addEventListener("click", togglePause);
+    byId("btn-add").addEventListener("click", openAddComposer);
+    byId("btn-empty-add").addEventListener("click", openAddComposer);
+    byId("btn-cancel-add").addEventListener("click", function () { setComposer(false); });
+    byId("btn-cancel-add-2").addEventListener("click", function () { setComposer(false); });
     byId("btn-create-batch").addEventListener("click", createBatch);
     byId("btn-sync-all").addEventListener("click", syncAll);
     byId("btn-test").addEventListener("click", testConnection);
     byId("btn-save-settings").addEventListener("click", saveSettings);
     byId("node-search").addEventListener("input", renderNodes);
-    byId("btn-select-all-nodes").addEventListener("click", function () {
-      state.nodes.forEach(function (node) {
-        state.composerNodes.add(node.uuid);
-      });
-      renderNodes();
-      updatePreview();
-    });
-    byId("btn-clear-nodes").addEventListener("click", function () {
-      state.composerNodes.clear();
-      renderNodes();
-      updatePreview();
-    });
     byId("domains").addEventListener("input", updatePreview);
     byId("mode-control").addEventListener("click", function (event) {
       var button = event.target.closest("button[data-mode]");
@@ -738,62 +943,55 @@
       byId("ttl").disabled = byId("proxied").checked;
       if (byId("proxied").checked) byId("ttl").value = "1";
     });
-    byId("filter-search").addEventListener("input", renderRecords);
-    byId("filter-status").addEventListener("change", renderRecords);
+    byId("filter-search").addEventListener("input", renderGroups);
+    byId("filter-status").addEventListener("change", renderGroups);
     byId("btn-clear-filters").addEventListener("click", function () {
       byId("filter-search").value = "";
       byId("filter-status").value = "";
-      renderRecords();
+      renderGroups();
     });
     byId("select-all").addEventListener("change", function () {
       var checked = byId("select-all").checked;
-      visibleRecords().forEach(function (record) {
-        if (checked) state.selectedRecords.add(record.id);
-        else state.selectedRecords.delete(record.id);
+      visibleGroups().forEach(function (group) {
+        if (checked) state.selectedGroups.add(group.id);
+        else state.selectedGroups.delete(group.id);
       });
-      renderRecords();
+      renderGroups();
     });
-    byId("btn-bulk-enable").addEventListener("click", function () {
-      runBulk("enable");
+    byId("btn-select-all-nodes").addEventListener("click", function () {
+      if (state.editingGroupId) return;
+      state.nodes.forEach(function (node) { state.composerNodes.add(node.uuid); });
+      renderNodes();
+      updatePreview();
     });
-    byId("btn-bulk-disable").addEventListener("click", function () {
-      runBulk("disable");
+    byId("btn-clear-nodes").addEventListener("click", function () {
+      if (state.editingGroupId) return;
+      state.composerNodes.clear();
+      renderNodes();
+      updatePreview();
     });
-    byId("btn-bulk-sync").addEventListener("click", function () {
-      runBulk("sync");
-    });
-    byId("btn-bulk-delete").addEventListener("click", function () {
-      runBulk("delete");
-    });
+    byId("btn-bulk-enable").addEventListener("click", function () { runBulk("enable"); });
+    byId("btn-bulk-disable").addEventListener("click", function () { runBulk("disable"); });
+    byId("btn-bulk-sync").addEventListener("click", function () { runBulk("sync"); });
+    byId("btn-bulk-delete").addEventListener("click", function () { runBulk("delete"); });
     byId("btn-refresh-logs").addEventListener("click", refreshLogs);
     byId("log-filter").addEventListener("change", refreshLogs);
     byId("btn-clear-logs").addEventListener("click", function () {
       if (!confirm("清空全部运行日志？")) return;
       api("/logs", { method: "DELETE" })
-        .then(function () {
-          refreshLogs();
-          showToast("日志已清空。", "success");
-        })
-        .catch(function (error) {
-          showToast(error.message, "error");
-        });
+        .then(function () { refreshLogs(); showToast("日志已清空。", "success"); })
+        .catch(function (error) { showToast(error.message, "error"); });
     });
   }
 
   function poll() {
     if (document.hidden) return;
-    refreshState().catch(function (error) {
-      showToast(error.message, "error");
-    });
+    refreshState().catch(function (error) { showToast(error.message, "error"); });
   }
 
   hydrateIcons();
   bind();
   loadAll()
-    .then(function () {
-      setInterval(poll, 4000);
-    })
-    .catch(function (error) {
-      showToast(error.message, "error");
-    });
+    .then(function () { setInterval(poll, 4000); })
+    .catch(function (error) { showToast(error.message, "error"); });
 })();

@@ -20,6 +20,7 @@ describe("batch expansion", () => {
     expect(records.filter((record) => record.type === "A")).toHaveLength(4);
     expect(records.filter((record) => record.type === "AAAA")).toHaveLength(4);
     expect(new Set(records.map((record) => record.id)).size).toBe(8);
+    expect(new Set(records.map((record) => record.groupId)).size).toBe(2);
   });
 
   it("forces auto TTL when proxied", () => {
