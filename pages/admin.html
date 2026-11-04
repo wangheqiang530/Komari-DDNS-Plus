@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Komari DDNS Plus</title>
+    <link rel="stylesheet" href="./admin.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="brand">
+          <img src="../assets/icon.svg" alt="" class="brand-icon" />
+          <div>
+            <h1>Komari DDNS Plus</h1>
+            <p>Cloudflare 批量动态解析</p>
+          </div>
+        </div>
+        <div class="header-status">
+          <span id="sync-state" class="status-pill status-idle">待命</span>
+          <button id="btn-refresh" class="icon-button" type="button" title="刷新">
+            <span data-icon="refresh"></span>
+          </button>
+        </div>
+      </header>
+
+      <nav class="tabs" aria-label="DDNS Plus 页面">
+        <button class="tab active" id="tab-records" type="button" data-panel="records">
+          <span data-icon="list"></span>
+          DDNS 规则
+        </button>
+        <button class="tab" id="tab-settings" type="button" data-panel="settings">
+          <span data-icon="settings"></span>
+          设置
+        </button>
+        <button class="tab" id="tab-logs" type="button" data-panel="logs">
+          <span data-icon="scroll"></span>
+          运行日志
+        </button>
+      </nav>
+
+      <main>
+        <section id="panel-records" class="panel">
+          <div class="toolbar">
+            <div class="toolbar-actions">
+              <button id="btn-add" class="button primary" type="button">
+                <span data-icon="plus"></span>
+                批量添加
+              </button>
+              <button id="btn-sync-all" class="button secondary" type="button">
+                <span data-icon="play"></span>
+                立即同步全部
+              </button>
+            </div>
+            <div id="sync-progress" class="sync-progress" hidden></div>
+          </div>
+
+          <section id="composer" class="composer" hidden>
+            <div class="section-heading">
+              <div>
+                <h2>批量添加规则</h2>
+                <p>选择节点、输入域名，生成独立的 A / AAAA 同步记录。</p>
+              </div>
+              <button id="btn-cancel-add" class="icon-button" type="button" title="关闭">
+                <span data-icon="x"></span>
+              </button>
+            </div>
+
+            <div class="composer-grid">
+              <div class="field node-field">
+                <div class="field-label-row">
+                  <label>选择节点</label>
+                  <span class="node-actions">
+                    <span id="node-count" class="muted">已选 0 台</span>
+                    <button id="btn-select-all-nodes" type="button">全选</button>
+                    <button id="btn-clear-nodes" type="button">清空</button>
+                  </span>
+                </div>
+                <div class="search-box">
+                  <span data-icon="search"></span>
+                  <input id="node-search" type="search" placeholder="搜索节点" autocomplete="off" />
+                </div>
+                <div id="node-list" class="node-list"></div>
+              </div>
+
+              <div class="field domain-field">
+                <div class="field-label-row">
+                  <label for="domains">域名</label>
+                  <span id="domain-count" class="muted">0 个域名</span>
+                </div>
+                <textarea id="domains" rows="8" placeholder="home.example.com&#10;v6.example.com"></textarea>
+                <small>每行一个，也支持逗号或空格分隔；自动去重。</small>
+              </div>
+            </div>
+
+            <div class="composer-grid compact">
+              <div class="field">
+                <label>地址模式</label>
+                <div class="segmented" id="mode-control">
+                  <button type="button" data-mode="v4">IPv4</button>
+                  <button type="button" data-mode="v6">IPv6</button>
+                  <button type="button" data-mode="dual" class="active">IPv4 + IPv6</button>
+                </div>
+              </div>
+              <div class="field">
+                <label for="ttl">TTL</label>
+                <select id="ttl">
+                  <option value="1">自动</option>
+                  <option value="60">1 分钟</option>
+                  <option value="120">2 分钟</option>
+                  <option value="300">5 分钟</option>
+                  <option value="600">10 分钟</option>
+                  <option value="900">15 分钟</option>
+                  <option value="1800">30 分钟</option>
+                  <option value="3600">1 小时</option>
+                  <option value="43200">12 小时</option>
+                  <option value="86400">1 天</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="interval">同步间隔</label>
+                <select id="interval">
+                  <option value="1">每 1 分钟</option>
+                  <option value="5">每 5 分钟</option>
+                  <option value="10">每 10 分钟</option>
+                  <option value="15">每 15 分钟</option>
+                  <option value="30">每 30 分钟</option>
+                  <option value="60">每 60 分钟</option>
+                </select>
+              </div>
+              <div class="field switch-field">
+                <label class="switch-row">
+                  <span>
+                    <b>Cloudflare 代理</b>
+                    <small>开启后 TTL 固定为自动</small>
+                  </span>
+                  <input id="proxied" type="checkbox" />
+                  <span class="switch"></span>
+                </label>
+              </div>
+              <div class="field switch-field">
+                <label class="switch-row">
+                  <span>
+                    <b>接管唯一已有记录</b>
+                    <small>仅单条、无备注的同类型记录</small>
+                  </span>
+                  <input id="adopt-existing" type="checkbox" />
+                  <span class="switch"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="composer-footer">
+              <span id="batch-preview" class="preview-text">等待选择节点和域名</span>
+              <div class="composer-actions">
+                <button id="btn-cancel-add-2" class="button secondary" type="button">取消</button>
+                <button id="btn-create-batch" class="button primary" type="button">
+                  <span data-icon="plus"></span>
+                  创建规则
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <div id="bulk-bar" class="bulk-bar" hidden>
+            <span id="bulk-count">已选 0 条</span>
+            <div class="bulk-actions">
+              <button id="btn-bulk-enable" class="button subtle" type="button">
+                <span data-icon="power"></span>
+                启用
+              </button>
+              <button id="btn-bulk-disable" class="button subtle" type="button">
+                <span data-icon="pause"></span>
+                停用
+              </button>
+              <button id="btn-bulk-sync" class="button subtle" type="button">
+                <span data-icon="play"></span>
+                同步
+              </button>
+              <button id="btn-bulk-delete" class="button danger" type="button">
+                <span data-icon="trash"></span>
+                删除规则
+              </button>
+            </div>
+          </div>
+
+          <div class="filter-bar">
+            <div class="search-box table-search">
+              <span data-icon="search"></span>
+              <input id="filter-search" type="search" placeholder="筛选域名或节点" autocomplete="off" />
+            </div>
+            <select id="filter-status" aria-label="按状态筛选">
+              <option value="">全部状态</option>
+              <option value="success">正常</option>
+              <option value="error">失败</option>
+              <option value="skipped">已跳过</option>
+              <option value="disabled">已停用</option>
+              <option value="pending">待同步</option>
+            </select>
+            <button id="btn-clear-filters" class="button subtle" type="button">清除筛选</button>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th class="check-cell"><input id="select-all" type="checkbox" aria-label="全选" /></th>
+                  <th>域名</th>
+                  <th>类型</th>
+                  <th>节点</th>
+                  <th>当前 IP</th>
+                  <th>TTL</th>
+                  <th>代理</th>
+                  <th>状态</th>
+                  <th>上次同步</th>
+                  <th class="action-cell">操作</th>
+                </tr>
+              </thead>
+              <tbody id="records-body"></tbody>
+            </table>
+            <div id="empty-records" class="empty-state" hidden>
+              <span data-icon="globe"></span>
+              <h3>还没有 DDNS 规则</h3>
+              <p>先配置 Cloudflare 凭据，然后批量添加域名。</p>
+              <button id="btn-empty-add" class="button primary" type="button">
+                <span data-icon="plus"></span>
+                批量添加
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section id="panel-settings" class="panel" hidden>
+          <div class="settings-layout">
+            <div class="settings-main">
+              <div class="section-heading">
+                <div>
+                  <h2>Cloudflare 连接</h2>
+                  <p>凭据只保存在 Komari 服务端的插件存储目录。</p>
+                </div>
+              </div>
+
+              <div class="field">
+                <label>认证方式</label>
+                <div class="segmented auth-segmented" id="auth-mode-control">
+                  <button type="button" data-auth="token" class="active">API Token</button>
+                  <button type="button" data-auth="key">Global API Key</button>
+                </div>
+              </div>
+
+              <div id="group-token" class="auth-group">
+                <div class="field">
+                  <label for="token">API Token</label>
+                  <input id="token" type="password" autocomplete="new-password" placeholder="粘贴 Cloudflare API Token" />
+                  <small id="token-hint">建议使用 Zone.Zone:Read 和 Zone.DNS:Edit 权限。</small>
+                </div>
+              </div>
+
+              <div id="group-key" class="auth-group" hidden>
+                <div class="field">
+                  <label for="email">Cloudflare 登录邮箱</label>
+                  <input id="email" type="email" autocomplete="off" placeholder="you@example.com" />
+                </div>
+                <div class="field">
+                  <label for="api-key">Global API Key</label>
+                  <input id="api-key" type="password" autocomplete="new-password" placeholder="粘贴 Global API Key" />
+                  <small id="key-hint">这不是 API Token，也不是 Origin CA Key。</small>
+                </div>
+              </div>
+
+              <div class="inline-actions">
+                <button id="btn-test" class="button secondary" type="button">
+                  <span data-icon="plug"></span>
+                  测试连接
+                </button>
+                <span id="test-result" class="test-result"></span>
+              </div>
+
+              <div class="divider"></div>
+
+              <div class="section-heading compact-heading">
+                <div>
+                  <h2>同步选项</h2>
+                </div>
+              </div>
+              <div class="settings-grid">
+                <div class="field">
+                  <label for="settings-interval">默认同步间隔</label>
+                  <select id="settings-interval">
+                    <option value="1">每 1 分钟</option>
+                    <option value="5">每 5 分钟</option>
+                    <option value="10">每 10 分钟</option>
+                    <option value="15">每 15 分钟</option>
+                    <option value="30">每 30 分钟</option>
+                    <option value="60">每 60 分钟</option>
+                  </select>
+                </div>
+                <div class="field switch-field">
+                  <label class="switch-row">
+                    <span>
+                      <b>发送同步通知</b>
+                      <small>使用 Komari 已配置的通知渠道</small>
+                    </span>
+                    <input id="notify" type="checkbox" />
+                    <span class="switch"></span>
+                  </label>
+                </div>
+              </div>
+              <div class="inline-actions settings-save">
+                <button id="btn-save-settings" class="button primary" type="button">
+                  <span data-icon="check"></span>
+                  保存设置
+                </button>
+              </div>
+            </div>
+
+            <aside class="settings-aside">
+              <h3>安全提示</h3>
+              <p>推荐使用 API Token。Global API Key 拥有账户级完整权限，只应在必要时使用。</p>
+              <p>密钥保存后不会回显；留空保存会保留当前密钥。</p>
+              <p>测试连接只读取账户和 Zone 信息，不会写入 DNS。</p>
+            </aside>
+          </div>
+        </section>
+
+        <section id="panel-logs" class="panel" hidden>
+          <div class="toolbar">
+            <div class="toolbar-actions">
+              <button id="btn-refresh-logs" class="button secondary" type="button">
+                <span data-icon="refresh"></span>
+                刷新日志
+              </button>
+              <button id="btn-clear-logs" class="button danger" type="button">
+                <span data-icon="trash"></span>
+                清空日志
+              </button>
+            </div>
+            <select id="log-filter" aria-label="日志级别">
+              <option value="">全部级别</option>
+              <option value="success">成功</option>
+              <option value="warning">警告</option>
+              <option value="error">错误</option>
+              <option value="info">信息</option>
+            </select>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>级别</th>
+                  <th>动作</th>
+                  <th>域名</th>
+                  <th>消息</th>
+                </tr>
+              </thead>
+              <tbody id="logs-body"></tbody>
+            </table>
+            <div id="empty-logs" class="empty-state" hidden>
+              <span data-icon="scroll"></span>
+              <h3>暂无运行日志</h3>
+              <p>同步或保存设置后，这里会显示操作记录。</p>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    </div>
+
+    <script src="./admin.js"></script>
+  </body>
+</html>

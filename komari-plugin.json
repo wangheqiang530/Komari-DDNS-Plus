@@ -1,0 +1,37 @@
+{
+  "$schema": "./node_modules/@komari-monitor/plugin-sdk/schema/komari-plugin.schema.json",
+  "name": {
+    "zh_CN": "Komari DDNS Plus",
+    "en": "Komari DDNS Plus"
+  },
+  "short": "ddns-plus",
+  "description": {
+    "zh_CN": "批量将 Komari 节点上报的 IPv4/IPv6 地址同步到 Cloudflare DNS。",
+    "en": "Batch synchronize IPv4 and IPv6 addresses reported by Komari nodes to Cloudflare DNS."
+  },
+  "author": "wangheqiang530",
+  "version": "0.0.1",
+  "url": "https://github.com/wangheqiang530/Komari-DDNS-Plus",
+  "icon": "assets/icon.svg",
+  "komari": ">=1.4.0",
+  "entry": "script.js",
+  "permissions": {
+    "node": true,
+    "allowSystemRPC": true,
+    "allowRoutes": true,
+    "maxHTTPBodyBytes": 131072,
+    "timeout": 120
+  },
+  "pages": [
+    {
+      "file": "pages/admin.html",
+      "title": {
+        "zh_CN": "DDNS Plus",
+        "en": "DDNS Plus"
+      },
+      "icon": "assets/icon.svg",
+      "type": "iframe",
+      "visibility": "admin"
+    }
+  ]
+}

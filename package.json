@@ -1,0 +1,31 @@
+{
+  "name": "komari-plugin-ddns-plus",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Batch Cloudflare DDNS for Komari with IPv4 and IPv6 support",
+  "license": "MIT",
+  "scripts": {
+    "check": "komari-plugin-dev check",
+    "build": "komari-plugin-dev build",
+    "pack": "komari-plugin-dev build && komari-plugin-dev pack",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "preview": "node scripts/preview.mjs",
+    "plugin:install": "komari-plugin-dev install --enable",
+    "dev": "komari-plugin-dev dev",
+    "verify": "npm run check && npm run typecheck && npm test && npm run pack"
+  },
+  "komari": {
+    "source": "src/plugin.ts"
+  },
+  "dependencies": {
+    "@komari-monitor/plugin-sdk": "1.4.3"
+  },
+  "devDependencies": {
+    "@komari-monitor/plugin-dev": "1.4.3",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "5.1.0"
+  }
+}
