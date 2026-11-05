@@ -1518,7 +1518,7 @@
         statuses: snapshot.statuses,
         sync: snapshot.job,
         csrf: csrf2,
-        version: "0.0.3"
+        version: "0.0.4"
       });
     });
     server2.route("GET", "/ddns-plus/nodes", async (req, res) => {

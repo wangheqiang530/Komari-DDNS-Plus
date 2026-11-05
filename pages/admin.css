@@ -501,6 +501,27 @@ textarea {
   font-size: 11px;
 }
 
+.node-rule-count {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  margin-top: 5px;
+  padding: 2px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.node-rule-count.has-rules {
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
 .empty-inline {
   grid-column: 1 / -1;
   padding: 18px 10px;
@@ -603,11 +624,8 @@ textarea {
 .proxy-state svg {
   width: 100%;
   height: 100%;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.8;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+  fill: currentColor;
+  stroke: none;
 }
 
 .proxy-cloud.on,
@@ -625,6 +643,18 @@ textarea {
   align-items: center;
   gap: 5px;
   white-space: nowrap;
+}
+
+.proxy-state span {
+  color: inherit;
+}
+
+.proxy-label.off {
+  color: var(--muted);
+}
+
+.proxy-label.on {
+  color: var(--cloudflare-orange);
 }
 
 .proxy-state svg {
@@ -840,6 +870,7 @@ tbody tr:hover {
   white-space: nowrap;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
+  cursor: help;
 }
 
 .group-domain-list small {

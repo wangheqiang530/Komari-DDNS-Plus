@@ -194,6 +194,7 @@
     var on = byId("proxied").checked;
     holder.className = "proxy-cloud " + (on ? "on" : "off");
     holder.innerHTML = iconSvg("cloud");
+    byId("proxy-label").className = "proxy-label " + (on ? "on" : "off");
   }
 
   function proxyState(on) {
@@ -449,6 +450,16 @@
       name.appendChild(document.createTextNode(node.name || node.uuid));
       copy.appendChild(name);
       copy.appendChild(el("small", "", [node.ipv4 || "无 IPv4", node.ipv6 || "无 IPv6"].join(" · ")));
+      var ruleCount = state.groups.filter(function (group) {
+        return group.nodeUuid === node.uuid;
+      }).length;
+      copy.appendChild(
+        el(
+          "span",
+          "node-rule-count" + (ruleCount ? " has-rules" : ""),
+          ruleCount ? "已有 " + ruleCount + " 条规则" : "暂无规则",
+        ),
+      );
       label.appendChild(input);
       label.appendChild(copy);
       list.appendChild(label);
@@ -525,6 +536,10 @@
 
       var domainsCell = el("td");
       var domainText = el("div", "group-domain-list");
+      var domainTitle = group.domains.join("\n");
+      domainText.title = domainTitle;
+      domainText.setAttribute("aria-label", domainTitle);
+      domainsCell.title = domainTitle;
       domainText.appendChild(document.createTextNode(group.domains[0] || "—"));
       if (group.domains.length > 1) domainText.appendChild(el("small", "", "  +" + (group.domains.length - 1)));
       domainsCell.appendChild(domainText);

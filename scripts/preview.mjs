@@ -56,6 +56,34 @@ let records = [
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   },
+  {
+    id: "record-preview-extra-a",
+    groupId: "group-hk1-v4",
+    domain: "hk1-v4.example.com",
+    type: "A",
+    nodeUuid: "hk1-node",
+    ttl: 300,
+    proxied: false,
+    enabled: true,
+    intervalMinutes: 5,
+    adoptExisting: false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    id: "record-preview-extra-b",
+    groupId: "group-hk1-v4",
+    domain: "hk1-v6.example.com",
+    type: "A",
+    nodeUuid: "hk1-node",
+    ttl: 300,
+    proxied: false,
+    enabled: true,
+    intervalMinutes: 5,
+    adoptExisting: false,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
 ];
 
 let groups = [
@@ -84,6 +112,20 @@ let groups = [
     intervalMinutes: 5,
     adoptExisting: false,
     recordIds: ["record-preview-sg"],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  },
+  {
+    id: "group-hk1-v4",
+    nodeUuid: "hk1-node",
+    domains: ["hk1-v4.example.com", "hk1-v6.example.com"],
+    mode: "v4",
+    ttl: 300,
+    proxied: false,
+    enabled: true,
+    intervalMinutes: 5,
+    adoptExisting: false,
+    recordIds: ["record-preview-extra-a", "record-preview-extra-b"],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   },
@@ -123,6 +165,20 @@ const statuses = {
     currentIp: "129.221.157.155",
     lastCheckedAt: new Date(Date.now() - 65_000).toISOString(),
     lastError: "Cloudflare 代理记录与当前设置不一致，将在下个周期重试。",
+  },
+  "record-preview-extra-a": {
+    state: "success",
+    action: "unchanged",
+    currentIp: "45.136.12.202",
+    lastCheckedAt: new Date(Date.now() - 20_000).toISOString(),
+    lastSuccessAt: new Date(Date.now() - 20_000).toISOString(),
+  },
+  "record-preview-extra-b": {
+    state: "success",
+    action: "unchanged",
+    currentIp: "45.136.12.203",
+    lastCheckedAt: new Date(Date.now() - 20_000).toISOString(),
+    lastSuccessAt: new Date(Date.now() - 20_000).toISOString(),
   },
 };
 
@@ -228,7 +284,7 @@ const server = http.createServer(async (req, res) => {
         statuses,
         sync,
         csrf: "preview-csrf",
-        version: "0.0.3",
+        version: "0.0.4",
       });
       return;
     }

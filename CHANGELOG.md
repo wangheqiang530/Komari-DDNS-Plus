@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.4
+
+- Show the existing rule count on each node in the node picker.
+- Add a hover title with all domains for grouped rule rows.
+- Use solid Cloudflare proxy cloud icons and color the adjacent status text.
+
 ## 0.0.3
 
 - Add selectable local-IP or Cloudflare-panel comparison modes.
