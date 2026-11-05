@@ -119,7 +119,7 @@ export function registerRoutes(deps: RouteDependencies): void {
       statuses: snapshot.statuses,
       sync: snapshot.job,
       csrf,
-      version: "0.0.2",
+      version: "0.0.3",
     });
   });
 

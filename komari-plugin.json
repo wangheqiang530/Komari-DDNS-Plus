@@ -10,7 +10,7 @@
     "en": "Batch synchronize IPv4 and IPv6 addresses reported by Komari nodes to Cloudflare DNS."
   },
   "author": "wangheqiang530",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "url": "https://github.com/wangheqiang530/Komari-DDNS-Plus",
   "icon": "assets/icon.svg",
   "komari": ">=1.4.0",

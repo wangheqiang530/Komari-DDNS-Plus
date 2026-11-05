@@ -31,6 +31,7 @@ describe("domain and settings validation", () => {
     });
     const exposed = publicSettings(settings);
     expect(exposed.hasToken).toBe(true);
+    expect(exposed.compareMode).toBe("local");
     expect(exposed).not.toHaveProperty("token");
     expect(JSON.stringify(exposed)).not.toContain("t".repeat(40));
   });
@@ -128,5 +129,21 @@ describe("domain and settings validation", () => {
         adoptExisting: false,
       }),
     ).toThrow(/代理开关/);
+  });
+
+  it("validates the IP comparison mode", () => {
+    const settings = normalizeSettings({
+      authMode: "token",
+      token: "t".repeat(40),
+      compareMode: "cloudflare",
+    });
+    expect(settings.compareMode).toBe("cloudflare");
+    expect(() =>
+      normalizeSettings({
+        authMode: "token",
+        token: "t".repeat(40),
+        compareMode: "dns",
+      }),
+    ).toThrow(/对比方式/);
   });
 });

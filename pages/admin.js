@@ -36,6 +36,7 @@
     plug: '<path d="M12 22v-5M9 7V2M15 7V2M6 7h12v4a6 6 0 0 1-12 0V7Z"/>',
     check: '<path d="m20 6-11 11-5-5"/>',
     globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+    cloud: '<path d="M17.5 19H7a5 5 0 1 1 1.6-9.8A7 7 0 0 1 22 12a4 4 0 0 1-4.5 7Z"/>',
     edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
     chevron: '<path d="m9 18 6-6-6-6"/>',
     alert: '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/>',
@@ -65,6 +66,79 @@
 
   function byId(id) {
     return document.getElementById(id);
+  }
+
+  function parentThemeContext() {
+    try {
+      if (window.parent && window.parent !== window && window.parent.document) {
+        return {
+          doc: window.parent.document,
+          win: window.parent,
+        };
+      }
+    } catch (_) {
+      // Fall back to this document when the parent is cross-origin.
+    }
+    return { doc: document, win: window };
+  }
+
+  function resolveDarkMode(context) {
+    var forced = new URLSearchParams(location.search).get("theme");
+    if (forced === "dark") return true;
+    if (forced === "light") return false;
+    var root = context.doc.documentElement;
+    if (root && root.classList.contains("dark")) return true;
+    try {
+      var appearance = context.win.localStorage.getItem("appearance");
+      if (appearance === "dark") return true;
+      if (appearance === "light") return false;
+    } catch (_) {
+      // Ignore storage restrictions and use the media query.
+    }
+    return Boolean(context.win.matchMedia && context.win.matchMedia("(prefers-color-scheme: dark)").matches);
+  }
+
+  function syncThemeFromParent() {
+    var context = parentThemeContext();
+    var dark = resolveDarkMode(context);
+    document.documentElement.classList.toggle("dark", dark);
+    try {
+      var source = context.doc.querySelector(".theme-root") || context.doc.documentElement;
+      var styles = context.win.getComputedStyle(source);
+      var variables = {
+        "--accent": "--accent-9",
+        "--accent-dark": "--accent-10",
+        "--accent-soft": "--accent-3",
+        "--accent-contrast": "--accent-contrast",
+        "--accent-text": "--accent-11",
+      };
+      Object.keys(variables).forEach(function (target) {
+        var value = styles.getPropertyValue(variables[target]).trim();
+        if (value) document.documentElement.style.setProperty(target, value);
+      });
+    } catch (_) {
+      // The local defaults remain usable if the parent variables are unavailable.
+    }
+  }
+
+  function watchTheme() {
+    syncThemeFromParent();
+    var context = parentThemeContext();
+    try {
+      new MutationObserver(syncThemeFromParent).observe(context.doc.documentElement, {
+        attributes: true,
+        attributeFilter: ["class", "style"],
+      });
+    } catch (_) {
+      // MutationObserver is optional for older embedded browsers.
+    }
+    window.addEventListener("storage", syncThemeFromParent);
+    if (context.win.matchMedia) {
+      var media = context.win.matchMedia("(prefers-color-scheme: dark)");
+      if (media.addEventListener) media.addEventListener("change", syncThemeFromParent);
+      else if (media.addListener) media.addListener(syncThemeFromParent);
+    }
+    setInterval(syncThemeFromParent, 2000);
   }
 
   function showToast(message, kind) {
@@ -112,6 +186,20 @@
 
   function modeLabel(mode) {
     return mode === "v4" ? "IPv4" : mode === "v6" ? "IPv6" : "IPv4 + IPv6";
+  }
+
+  function updateProxyIcon() {
+    var holder = byId("proxy-cloud-icon");
+    if (!holder) return;
+    var on = byId("proxied").checked;
+    holder.className = "proxy-cloud " + (on ? "on" : "off");
+    holder.innerHTML = iconSvg("cloud");
+  }
+
+  function proxyState(on) {
+    var node = el("span", "proxy-state " + (on ? "on" : "off"));
+    node.innerHTML = iconSvg("cloud") + "<span>" + (on ? "已代理" : "未代理") + "</span>";
+    return node;
   }
 
   function nodeName(uuid) {
@@ -443,7 +531,9 @@
       tr.appendChild(domainsCell);
 
       tr.appendChild(el("td", "", ttlLabel(group.ttl)));
-      tr.appendChild(el("td", "", group.proxied ? "已代理" : "未代理"));
+      var proxyCell = el("td");
+      proxyCell.appendChild(proxyState(group.proxied));
+      tr.appendChild(proxyCell);
 
       var statusCell = el("td");
       statusCell.appendChild(el("span", "badge " + status.state, status.label));
@@ -585,6 +675,8 @@
     byId("email").value = settings.email || "";
     byId("settings-interval").value = String(settings.intervalMinutes || 1);
     byId("notify").checked = Boolean(settings.notify);
+    byId("compare-mode").value = settings.compareMode || "local";
+    updateCompareModeHelp();
     byId("token").value = "";
     byId("api-key").value = "";
     byId("token-hint").textContent = settings.hasToken
@@ -600,6 +692,14 @@
       button.classList.toggle("active", button.getAttribute("data-mode") === state.mode);
     });
     updatePreview();
+  }
+
+  function updateCompareModeHelp() {
+    var mode = byId("compare-mode").value;
+    byId("compare-mode-help").textContent =
+      mode === "cloudflare"
+        ? "每次检查都读取 Cloudflare DNS 记录并对比，能发现 Cloudflare 端被外部修改的 IP。"
+        : "先对比节点 IP 与上次成功推送 IP；未变化时不访问 Cloudflare DNS 接口，手动同步仍会强制检查。";
   }
 
   function updatePreview() {
@@ -650,6 +750,7 @@
     state.mode = "dual";
     renderNodes();
     renderMode();
+    updateProxyIcon();
   }
 
   function openAddComposer() {
@@ -678,6 +779,7 @@
     byId("ttl").disabled = Boolean(group.proxied);
     renderNodes();
     renderMode();
+    updateProxyIcon();
     setComposer(true);
   }
 
@@ -702,6 +804,7 @@
     renderGroups();
     renderSettings();
     renderMode();
+    updateProxyIcon();
   }
 
   function loadAll() {
@@ -784,6 +887,7 @@
       apiKey: byId("api-key").value,
       intervalMinutes: Number(byId("settings-interval").value),
       notify: byId("notify").checked,
+      compareMode: byId("compare-mode").value,
     };
     api("/settings", { method: "POST", body: JSON.stringify(payload) })
       .then(function (data) {
@@ -942,7 +1046,9 @@
     byId("proxied").addEventListener("change", function () {
       byId("ttl").disabled = byId("proxied").checked;
       if (byId("proxied").checked) byId("ttl").value = "1";
+      updateProxyIcon();
     });
+    byId("compare-mode").addEventListener("change", updateCompareModeHelp);
     byId("filter-search").addEventListener("input", renderGroups);
     byId("filter-status").addEventListener("change", renderGroups);
     byId("btn-clear-filters").addEventListener("click", function () {
@@ -989,6 +1095,7 @@
     refreshState().catch(function (error) { showToast(error.message, "error"); });
   }
 
+  watchTheme();
   hydrateIcons();
   bind();
   loadAll()

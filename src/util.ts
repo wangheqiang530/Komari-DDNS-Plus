@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import {
   AuthCredentials,
   AuthMode,
+  CompareMode,
   DdnsRecord,
   INTERVAL_VALUES,
   MAX_DOMAINS_PER_BATCH,
@@ -85,6 +86,13 @@ export function normalizeAuthMode(value: unknown, fallback: AuthMode = "token"):
   return value === "key" || value === "token" ? value : fallback;
 }
 
+export function normalizeCompareMode(
+  value: unknown,
+  fallback: CompareMode = "local",
+): CompareMode {
+  return value === "local" || value === "cloudflare" ? value : fallback;
+}
+
 export function normalizeSecret(value: unknown, label: string, required: boolean): string {
   const secret = typeof value === "string" ? value.trim() : "";
   if (!secret) {
@@ -110,6 +118,17 @@ export function normalizeSettings(input: unknown, previous?: Settings): Settings
   if (!input || typeof input !== "object") throw new PluginError("设置格式无效。");
   const raw = input as Record<string, unknown>;
   const authMode = normalizeAuthMode(raw.authMode, previous?.authMode || "token");
+  if (
+    raw.compareMode !== undefined &&
+    raw.compareMode !== "local" &&
+    raw.compareMode !== "cloudflare"
+  ) {
+    throw new PluginError("IP 对比方式无效。");
+  }
+  const compareMode = normalizeCompareMode(
+    raw.compareMode,
+    previous?.compareMode || "local",
+  );
   const tokenInput = typeof raw.token === "string" ? raw.token.trim() : "";
   const keyInput = typeof raw.apiKey === "string" ? raw.apiKey.trim() : "";
   const emailInput = typeof raw.email === "string" ? raw.email.trim() : "";
@@ -157,6 +176,7 @@ export function normalizeSettings(input: unknown, previous?: Settings): Settings
     apiKey,
     notify: raw.notify === undefined ? Boolean(previous?.notify) : Boolean(raw.notify),
     paused: raw.paused === undefined ? Boolean(previous?.paused) : Boolean(raw.paused),
+    compareMode,
     intervalMinutes,
     updatedAt: nowIso(),
   };
@@ -196,6 +216,7 @@ export function publicSettings(settings: Settings): PublicSettings {
     hasApiKey: Boolean(settings.apiKey),
     notify: settings.notify,
     paused: settings.paused,
+    compareMode: settings.compareMode,
     intervalMinutes: settings.intervalMinutes,
     updatedAt: settings.updatedAt,
   };

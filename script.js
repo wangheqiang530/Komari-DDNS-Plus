@@ -519,6 +519,9 @@
   function normalizeAuthMode(value, fallback = "token") {
     return value === "key" || value === "token" ? value : fallback;
   }
+  function normalizeCompareMode(value, fallback = "local") {
+    return value === "local" || value === "cloudflare" ? value : fallback;
+  }
   function normalizeSecret(value, label, required) {
     const secret = typeof value === "string" ? value.trim() : "";
     if (!secret) {
@@ -542,6 +545,13 @@
     if (!input || typeof input !== "object") throw new PluginError("\u8BBE\u7F6E\u683C\u5F0F\u65E0\u6548\u3002");
     const raw = input;
     const authMode = normalizeAuthMode(raw.authMode, previous?.authMode || "token");
+    if (raw.compareMode !== void 0 && raw.compareMode !== "local" && raw.compareMode !== "cloudflare") {
+      throw new PluginError("IP \u5BF9\u6BD4\u65B9\u5F0F\u65E0\u6548\u3002");
+    }
+    const compareMode = normalizeCompareMode(
+      raw.compareMode,
+      previous?.compareMode || "local"
+    );
     const tokenInput = typeof raw.token === "string" ? raw.token.trim() : "";
     const keyInput = typeof raw.apiKey === "string" ? raw.apiKey.trim() : "";
     const emailInput = typeof raw.email === "string" ? raw.email.trim() : "";
@@ -573,6 +583,7 @@
       apiKey,
       notify: raw.notify === void 0 ? Boolean(previous?.notify) : Boolean(raw.notify),
       paused: raw.paused === void 0 ? Boolean(previous?.paused) : Boolean(raw.paused),
+      compareMode,
       intervalMinutes,
       updatedAt: nowIso()
     };
@@ -601,6 +612,7 @@
       hasApiKey: Boolean(settings.apiKey),
       notify: settings.notify,
       paused: settings.paused,
+      compareMode: settings.compareMode,
       intervalMinutes: settings.intervalMinutes,
       updatedAt: settings.updatedAt
     };
@@ -1066,7 +1078,7 @@
         errors: 0
       };
       setTimeout(() => {
-        void this.run(due).catch((error) => {
+        void this.run(due, force).catch((error) => {
           this.job.running = false;
           this.job.finishedAt = nowIso();
           this.job.message = redact(errorMessage(error), settings);
@@ -1086,7 +1098,7 @@
       }
       return this.start(void 0, false);
     }
-    async run(records) {
+    async run(records, forceCloudflare) {
       const settings = this.deps.storage.loadSettings();
       this.changes = [];
       this.failures = [];
@@ -1099,7 +1111,13 @@
           const previousStatus = this.statuses[record.id];
           let result;
           try {
-            result = await this.syncRecord(record, client, nodeMap);
+            result = await this.syncRecord(
+              record,
+              client,
+              nodeMap,
+              settings.compareMode,
+              forceCloudflare
+            );
           } catch (error) {
             const message = redact(errorMessage(error), settings);
             if (error instanceof CloudflareError && error.status === 429) {
@@ -1143,11 +1161,13 @@
       this.job.running = false;
       this.job.finishedAt = nowIso();
       this.job.message = `\u540C\u6B65\u5B8C\u6210\uFF1A\u5171 ${this.job.total} \u6761\uFF0C\u53D8\u66F4 ${this.job.changed} \u6761\uFF0C\u8DF3\u8FC7 ${this.job.skipped} \u6761\uFF0C\u5931\u8D25 ${this.job.errors} \u6761\u3002`;
-      this.deps.storage.appendLog({
-        level: this.job.errors ? "warning" : "success",
-        action: "sync",
-        message: this.job.message
-      });
+      if (this.job.changed > 0 || this.job.errors > 0) {
+        this.deps.storage.appendLog({
+          level: this.job.errors ? "warning" : "success",
+          action: "sync",
+          message: this.job.message
+        });
+      }
       await this.sendNotificationSummary(settings);
     }
     async sendNotificationSummary(settings) {
@@ -1198,7 +1218,7 @@
         });
       }
     }
-    async syncRecord(record, client, nodes) {
+    async syncRecord(record, client, nodes, compareMode, forceCloudflare) {
       if (!record.enabled) {
         this.statuses[record.id] = statusForRecord(record, "disabled", {
           action: "skipped"
@@ -1227,6 +1247,21 @@
         return { changed: false, action: "skipped" };
       }
       const ip = validateAddress(record.type === "A" ? node.ipv4 : node.ipv6, record.type);
+      const effectiveTtl = record.proxied ? 1 : record.ttl;
+      const previous = this.statuses[record.id];
+      if (!forceCloudflare && compareMode === "local" && previous?.state === "success" && previous.currentIp === ip && previous.recordId && previous.syncedTtl === effectiveTtl && previous.syncedProxied === record.proxied) {
+        this.statuses[record.id] = statusForRecord(record, "success", {
+          action: "unchanged",
+          currentIp: ip,
+          recordId: previous.recordId,
+          lastSuccessAt: previous.lastSuccessAt,
+          lastChangedAt: previous.lastChangedAt,
+          syncedTtl: effectiveTtl,
+          syncedProxied: record.proxied
+        });
+        this.job.skipped += 1;
+        return { changed: false, action: "unchanged", previousIp: ip, currentIp: ip };
+      }
       const zone = await client.zoneFor(record.domain);
       const existing = await client.listRecords(zone.id, record.domain, record.type);
       const marker = recordMarker(record.id);
@@ -1268,7 +1303,7 @@
         type: record.type,
         name: record.domain,
         content: ip,
-        ttl: record.proxied ? 1 : record.ttl,
+        ttl: effectiveTtl,
         proxied: record.proxied,
         comment: marker
       };
@@ -1278,7 +1313,9 @@
           currentIp: ip,
           recordId: current.id,
           lastSuccessAt: nowIso(),
-          lastChangedAt: this.statuses[record.id]?.lastChangedAt
+          lastChangedAt: this.statuses[record.id]?.lastChangedAt,
+          syncedTtl: payload.ttl,
+          syncedProxied: record.proxied
         });
         this.job.skipped += 1;
         return {
@@ -1295,7 +1332,9 @@
         currentIp: ip,
         recordId: updated.id,
         lastSuccessAt: changedAt,
-        lastChangedAt: changedAt
+        lastChangedAt: changedAt,
+        syncedTtl: payload.ttl,
+        syncedProxied: record.proxied
       });
       this.job.changed += 1;
       this.deps.storage.appendLog({
@@ -1479,7 +1518,7 @@
         statuses: snapshot.statuses,
         sync: snapshot.job,
         csrf: csrf2,
-        version: "0.0.2"
+        version: "0.0.3"
       });
     });
     server2.route("GET", "/ddns-plus/nodes", async (req, res) => {
@@ -1806,6 +1845,7 @@
     apiKey: "",
     notify: false,
     paused: false,
+    compareMode: "local",
     intervalMinutes: 1,
     updatedAt: ""
   };
@@ -1855,6 +1895,7 @@
         apiKey: typeof raw.apiKey === "string" ? raw.apiKey : "",
         notify: Boolean(raw.notify),
         paused: Boolean(raw.paused),
+        compareMode: raw.compareMode === "cloudflare" ? "cloudflare" : "local",
         intervalMinutes: Number(raw.intervalMinutes) || 1,
         updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : ""
       };

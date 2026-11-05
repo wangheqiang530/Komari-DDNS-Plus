@@ -31,6 +31,7 @@ function settings(authMode: "token" | "key" = "token"): Settings {
     apiKey: authMode === "key" ? "k".repeat(37) : "",
     notify: false,
     paused: false,
+    compareMode: "local",
     intervalMinutes: 1,
     updatedAt: "",
   };
@@ -330,6 +331,104 @@ describe("SyncEngine", () => {
     await waitForIdle(engine);
     expect(mock.update).toHaveBeenCalledTimes(1);
     expect(notify).not.toHaveBeenCalled();
+  });
+
+  it("skips Cloudflare DNS reads when local IP comparison is unchanged", async () => {
+    const storage = makeStorage();
+    const current = settings();
+    current.compareMode = "local";
+    storage.saveSettings(current);
+    storage.saveRecords([rule()]);
+    const mock = mockClient();
+    const nodes = [
+      {
+        uuid: "node-0001",
+        name: "HK1",
+        ipv4: "8.8.8.8",
+        ipv6: "",
+        online: true,
+        group: "",
+      },
+    ];
+    const first = new SyncEngine({
+      storage,
+      getNodes: async () => nodes,
+      notify: async () => undefined,
+      createClient: () => mock.client,
+    });
+    first.start();
+    await waitForIdle(first);
+    const statuses = first.snapshot().statuses;
+    statuses["record-0001"].nextRunAt = "2000-01-01T00:00:00.000Z";
+    storage.saveStatuses(statuses);
+
+    const zoneFor = vi.fn(async () => ({ id: "zone-1", name: "example.com", status: "active" }));
+    const listRecords = vi.fn(async () => {
+      throw new Error("Cloudflare DNS should not be queried");
+    });
+    const second = new SyncEngine({
+      storage,
+      getNodes: async () => nodes,
+      notify: async () => undefined,
+      createClient: () => ({
+        ...mock.client,
+        zoneFor,
+        listRecords,
+      }),
+    });
+    second.startDue();
+    await waitForIdle(second);
+    expect(zoneFor).not.toHaveBeenCalled();
+    expect(listRecords).not.toHaveBeenCalled();
+    expect(second.snapshot().statuses["record-0001"].action).toBe("unchanged");
+    expect(second.snapshot().job.skipped).toBe(1);
+  });
+
+  it("queries Cloudflare when cloud-panel comparison is selected", async () => {
+    const storage = makeStorage();
+    const current = settings();
+    current.compareMode = "cloudflare";
+    storage.saveSettings(current);
+    storage.saveRecords([rule()]);
+    const mock = mockClient();
+    const nodes = [
+      {
+        uuid: "node-0001",
+        name: "HK1",
+        ipv4: "8.8.8.8",
+        ipv6: "",
+        online: true,
+        group: "",
+      },
+    ];
+    const first = new SyncEngine({
+      storage,
+      getNodes: async () => nodes,
+      notify: async () => undefined,
+      createClient: () => mock.client,
+    });
+    first.start();
+    await waitForIdle(first);
+    const statuses = first.snapshot().statuses;
+    statuses["record-0001"].nextRunAt = "2000-01-01T00:00:00.000Z";
+    storage.saveStatuses(statuses);
+
+    const zoneFor = vi.fn(async () => ({ id: "zone-1", name: "example.com", status: "active" }));
+    const listRecords = vi.fn(async () => mock.records.slice());
+    const second = new SyncEngine({
+      storage,
+      getNodes: async () => nodes,
+      notify: async () => undefined,
+      createClient: () => ({
+        ...mock.client,
+        zoneFor,
+        listRecords,
+      }),
+    });
+    second.startDue();
+    await waitForIdle(second);
+    expect(zoneFor).toHaveBeenCalledTimes(1);
+    expect(listRecords).toHaveBeenCalledTimes(1);
   });
 
   it("does not run scheduled sync while paused", async () => {

@@ -96,6 +96,7 @@ let settings = {
   hasApiKey: false,
   notify: true,
   paused: false,
+  compareMode: "local",
   intervalMinutes: 1,
   updatedAt: new Date().toISOString(),
 };
@@ -191,6 +192,33 @@ const server = http.createServer(async (req, res) => {
     res.end();
     return;
   }
+  if (url.pathname === "/theme-parent.html") {
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(`<!doctype html>
+<html class="dark">
+  <head>
+    <meta charset="utf-8">
+    <style>
+      html, body, iframe { margin: 0; width: 100%; height: 100%; border: 0; }
+      body { background: #101419; }
+      .theme-root {
+        --accent-3: #1d314e;
+        --accent-9: #4f8df7;
+        --accent-10: #76a8ff;
+        --accent-11: #9dc2ff;
+        --accent-contrast: #ffffff;
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="theme-root">
+      <iframe src="/pages/admin.html"></iframe>
+    </div>
+  </body>
+</html>`);
+    return;
+  }
   if (url.pathname.startsWith("/ddns-plus/")) {
     if (req.method === "GET" && url.pathname === "/ddns-plus/state") {
       json(res, {
@@ -200,7 +228,7 @@ const server = http.createServer(async (req, res) => {
         statuses,
         sync,
         csrf: "preview-csrf",
-        version: "0.0.2",
+        version: "0.0.3",
       });
       return;
     }
@@ -218,10 +246,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "POST" && url.pathname === "/ddns-plus/settings") {
+      const body = await readBody(req);
       settings = {
         ...settings,
-        notify: true,
-        intervalMinutes: 1,
+        notify: Boolean(body.notify),
+        compareMode: body.compareMode === "cloudflare" ? "cloudflare" : "local",
+        intervalMinutes: Number(body.intervalMinutes) || 1,
         updatedAt: new Date().toISOString(),
       };
       json(res, {

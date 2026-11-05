@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.3
+
+- Add selectable local-IP or Cloudflare-panel comparison modes.
+- Skip Cloudflare DNS reads when local IP and sync settings are unchanged.
+- Add grey/orange Cloudflare proxy cloud icons.
+- Follow the Komari admin light/dark theme and accent color.
+- Force Cloudflare comparison for manual sync actions.
+
 ## 0.0.2
 
 - Fix API Token testing for user and account-owned tokens by checking Zone and DNS read access directly.

@@ -17,6 +17,7 @@ const DEFAULT_SETTINGS: Settings = {
   apiKey: "",
   notify: false,
   paused: false,
+  compareMode: "local",
   intervalMinutes: 1,
   updatedAt: "",
 };
@@ -75,6 +76,7 @@ export class Storage {
       apiKey: typeof raw.apiKey === "string" ? raw.apiKey : "",
       notify: Boolean(raw.notify),
       paused: Boolean(raw.paused),
+      compareMode: raw.compareMode === "cloudflare" ? "cloudflare" : "local",
       intervalMinutes: Number(raw.intervalMinutes) || 1,
       updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : "",
     };

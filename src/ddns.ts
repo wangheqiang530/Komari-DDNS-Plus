@@ -183,7 +183,7 @@ export class SyncEngine {
       errors: 0,
     };
     setTimeout(() => {
-      void this.run(due).catch((error) => {
+      void this.run(due, force).catch((error) => {
         this.job.running = false;
         this.job.finishedAt = nowIso();
         this.job.message = redact(errorMessage(error), settings);
@@ -205,7 +205,7 @@ export class SyncEngine {
     return this.start(undefined, false);
   }
 
-  private async run(records: DdnsRecord[]): Promise<void> {
+  private async run(records: DdnsRecord[], forceCloudflare: boolean): Promise<void> {
     const settings = this.deps.storage.loadSettings();
     this.changes = [];
     this.failures = [];
@@ -221,7 +221,13 @@ export class SyncEngine {
         const previousStatus = this.statuses[record.id];
         let result: RecordSyncResult | undefined;
         try {
-          result = await this.syncRecord(record, client, nodeMap);
+          result = await this.syncRecord(
+            record,
+            client,
+            nodeMap,
+            settings.compareMode,
+            forceCloudflare,
+          );
         } catch (error) {
           const message = redact(errorMessage(error), settings);
           if (error instanceof CloudflareError && error.status === 429) {
@@ -270,11 +276,13 @@ export class SyncEngine {
     this.job.running = false;
     this.job.finishedAt = nowIso();
     this.job.message = `同步完成：共 ${this.job.total} 条，变更 ${this.job.changed} 条，跳过 ${this.job.skipped} 条，失败 ${this.job.errors} 条。`;
-    this.deps.storage.appendLog({
-      level: this.job.errors ? "warning" : "success",
-      action: "sync",
-      message: this.job.message,
-    });
+    if (this.job.changed > 0 || this.job.errors > 0) {
+      this.deps.storage.appendLog({
+        level: this.job.errors ? "warning" : "success",
+        action: "sync",
+        message: this.job.message,
+      });
+    }
 
     await this.sendNotificationSummary(settings);
   }
@@ -335,6 +343,8 @@ export class SyncEngine {
     record: DdnsRecord,
     client: ReturnType<typeof createCloudflareClient>,
     nodes: Map<string, NodeInfo>,
+    compareMode: Settings["compareMode"],
+    forceCloudflare: boolean,
   ): Promise<RecordSyncResult> {
     if (!record.enabled) {
       this.statuses[record.id] = statusForRecord(record, "disabled", {
@@ -366,6 +376,29 @@ export class SyncEngine {
     }
 
     const ip = validateAddress(record.type === "A" ? node.ipv4 : node.ipv6, record.type);
+    const effectiveTtl = record.proxied ? 1 : record.ttl;
+    const previous = this.statuses[record.id];
+    if (
+      !forceCloudflare &&
+      compareMode === "local" &&
+      previous?.state === "success" &&
+      previous.currentIp === ip &&
+      previous.recordId &&
+      previous.syncedTtl === effectiveTtl &&
+      previous.syncedProxied === record.proxied
+    ) {
+      this.statuses[record.id] = statusForRecord(record, "success", {
+        action: "unchanged",
+        currentIp: ip,
+        recordId: previous.recordId,
+        lastSuccessAt: previous.lastSuccessAt,
+        lastChangedAt: previous.lastChangedAt,
+        syncedTtl: effectiveTtl,
+        syncedProxied: record.proxied,
+      });
+      this.job.skipped += 1;
+      return { changed: false, action: "unchanged", previousIp: ip, currentIp: ip };
+    }
     const zone = await client.zoneFor(record.domain);
     const existing = await client.listRecords(zone.id, record.domain, record.type);
     const marker = recordMarker(record.id);
@@ -414,7 +447,7 @@ export class SyncEngine {
       type: record.type,
       name: record.domain,
       content: ip,
-      ttl: record.proxied ? 1 : record.ttl,
+      ttl: effectiveTtl,
       proxied: record.proxied,
       comment: marker,
     };
@@ -432,6 +465,8 @@ export class SyncEngine {
         recordId: current.id,
         lastSuccessAt: nowIso(),
         lastChangedAt: this.statuses[record.id]?.lastChangedAt,
+        syncedTtl: payload.ttl,
+        syncedProxied: record.proxied,
       });
       this.job.skipped += 1;
       return {
@@ -452,6 +487,8 @@ export class SyncEngine {
       recordId: updated.id,
       lastSuccessAt: changedAt,
       lastChangedAt: changedAt,
+      syncedTtl: payload.ttl,
+      syncedProxied: record.proxied,
     });
     this.job.changed += 1;
     this.deps.storage.appendLog({

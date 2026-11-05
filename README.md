@@ -2,7 +2,7 @@
 
 Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 Komari 节点上报的 IPv4/IPv6 地址，批量维护 Cloudflare DNS 记录。
 
-当前版本：`0.0.2`
+当前版本：`0.0.3`
 
 ## 功能
 
@@ -15,6 +15,7 @@ Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 K
 - 支持 Cloudflare API Token 或邮箱 + Global API Key。
 - 设置页提供连接测试，不会写入 DNS；支持用户 API Token 和 Account API Token。
 - TTL、Cloudflare 代理、同步间隔和通知开关。
+- IP 对比方式可选：本地缓存对比或 Cloudflare 面板对比。
 - 规则组状态、目标级当前 IP、上次同步时间和错误信息。
 - 批量启用、停用、删除和立即同步。
 - 全局暂停或恢复计划同步，手动同步不受影响。
@@ -23,6 +24,8 @@ Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 K
 - 运行日志和带节点、域名、类型、IP 明细的变更通知。
 - 仅 IP 变更或失败状态开始时通知，持续失败不会反复发送。
 - 自动迁移 v0.0.1 的平铺记录为节点规则组。
+- Cloudflare 代理使用灰/橙小黄云图标。
+- 插件自动跟随 Komari 面板的明暗主题和主题强调色。
 
 ## 环境
 
@@ -33,7 +36,7 @@ Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 K
 
 ## 安装
 
-1. 在 GitHub Releases 下载 `ddns-plus-0.0.2.zip`。
+1. 在 GitHub Releases 下载 `ddns-plus-0.0.3.zip`。
 2. 在 Komari 后台的插件管理页面上传 ZIP。
 3. 启用插件并批准系统 RPC 和 HTTP 路由权限。
 4. 打开后台侧边栏的 **DDNS Plus** 页面。
@@ -103,7 +106,7 @@ npm run pack
 生成的安装包：
 
 ```text
-dist/ddns-plus-0.0.2.zip
+dist/ddns-plus-0.0.3.zip
 ```
 
 管理页本地预览地址：
@@ -128,12 +131,19 @@ http://127.0.0.1:18795/pages/admin.html
 npm run dev
 ```
 
-## v0.0.2 限制
+## v0.0.3 限制
 
 - 删除规则组时暂不提供 Cloudflare DNS 记录清理。
 - 暂不支持在规则组内单独编辑某个域名目标。
 - 暂不支持一个规则组内按域名映射不同节点。
 - 通知按一次同步任务汇总发送，不逐条发送；同一失败状态持续期间只通知首次。
+
+## IP 对比方式
+
+- **本地缓存对比（默认）**：先对比 Komari 节点 IP 与上次成功推送的 IP。IP、TTL 和代理状态都没有变化时，不访问 Cloudflare DNS 接口。适合大多数 DDNS 场景，但不会发现 Cloudflare 端被外部修改的记录；手动同步会强制检查。
+- **Cloudflare 面板对比**：每次检查都读取 Cloudflare DNS 记录并对比，可以发现 Cloudflare 端被外部修改的 IP，但请求次数更多。
+
+手动点击“立即同步”会强制读取 Cloudflare 记录，不受本地缓存跳过逻辑影响。
 
 ## License
 

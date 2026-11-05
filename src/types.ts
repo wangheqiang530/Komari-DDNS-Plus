@@ -1,6 +1,7 @@
 export type AuthMode = "token" | "key";
 export type DnsRecordType = "A" | "AAAA";
 export type CreateMode = "v4" | "v6" | "dual";
+export type CompareMode = "local" | "cloudflare";
 export type StatusState =
   | "pending"
   | "running"
@@ -38,6 +39,7 @@ export interface Settings {
   apiKey: string;
   notify: boolean;
   paused: boolean;
+  compareMode: CompareMode;
   intervalMinutes: number;
   updatedAt: string;
 }
@@ -49,6 +51,7 @@ export interface PublicSettings {
   hasApiKey: boolean;
   notify: boolean;
   paused: boolean;
+  compareMode: CompareMode;
   intervalMinutes: number;
   updatedAt: string;
 }
@@ -93,6 +96,8 @@ export interface RecordStatus {
   lastChangedAt?: string;
   lastError?: string;
   nextRunAt?: string;
+  syncedTtl?: number;
+  syncedProxied?: boolean;
 }
 
 export interface SyncJob {

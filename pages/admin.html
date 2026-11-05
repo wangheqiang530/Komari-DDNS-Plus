@@ -137,7 +137,7 @@
               <div class="field switch-field">
                 <label class="switch-row">
                   <span>
-                    <b>Cloudflare 代理</b>
+                    <b><span id="proxy-cloud-icon" class="proxy-cloud off"></span> Cloudflare 代理</b>
                     <small>开启后 TTL 固定为自动</small>
                   </span>
                   <input id="proxied" type="checkbox" />
@@ -309,6 +309,14 @@
                     <input id="notify" type="checkbox" />
                     <span class="switch"></span>
                   </label>
+                </div>
+                <div class="field compare-mode-field">
+                  <label for="compare-mode">IP 对比方式</label>
+                  <select id="compare-mode">
+                    <option value="local">本地缓存对比（减少 Cloudflare 请求）</option>
+                    <option value="cloudflare">Cloudflare 面板对比</option>
+                  </select>
+                  <small id="compare-mode-help">先对比节点 IP 与上次成功推送 IP；未变化时不访问 Cloudflare DNS 接口。</small>
                 </div>
               </div>
               <div class="inline-actions settings-save">
