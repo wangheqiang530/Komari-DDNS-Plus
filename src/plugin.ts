@@ -19,13 +19,19 @@ function normalizeNodeList(value: unknown): Record<string, unknown>[] {
   return [];
 }
 
+/**
+ * 在线状态未知时按离线处理：宁可这一轮跳过同步，也不要把可能过期的 IP 写进 DNS。
+ */
 function nodeOnline(status: unknown): boolean {
-  if (!status) return true;
+  if (status === undefined || status === null) return false;
   if (typeof status === "boolean") return status;
-  if (typeof status === "object" && "online" in (status as Record<string, unknown>)) {
-    return (status as Record<string, unknown>).online !== false;
+  if (typeof status === "object") {
+    const online = (status as Record<string, unknown>).online;
+    if (typeof online === "boolean") return online;
+    const connected = (status as Record<string, unknown>).connected;
+    if (typeof connected === "boolean") return connected;
   }
-  return true;
+  return false;
 }
 
 async function getNodes(uuids?: string[]): Promise<NodeInfo[]> {
@@ -37,6 +43,7 @@ async function getNodes(uuids?: string[]): Promise<NodeInfo[]> {
   });
   const selected = list.map((node) => String(node.uuid || "")).filter(Boolean);
   let statuses: Record<string, unknown> = {};
+  let statusError = "";
   try {
     const result = await server.call<Record<string, unknown>>(
       "common:getNodesLatestStatus",
@@ -44,18 +51,31 @@ async function getNodes(uuids?: string[]): Promise<NodeInfo[]> {
     );
     statuses = result && typeof result === "object" ? result : {};
   } catch (error) {
-    console.warn("[ddns-plus] getNodesLatestStatus failed:", errorMessage(error));
+    statusError = errorMessage(error);
+    console.warn("[ddns-plus] getNodesLatestStatus failed:", statusError);
+  }
+
+  if (statusError) {
+    // 状态读取失败时不要继续用「未知」猜测，直接把整批节点标成离线，并让上层写一次告警日志。
+    const settings = storage.loadSettings();
+    storage.appendLog({
+      level: "warning",
+      action: "sync",
+      message: `无法读取节点在线状态，本轮全部跳过：${redact(statusError, settings)}`,
+    });
+    storage.flushLogs();
   }
 
   return list
     .map((node) => {
       const uuid = String(node.uuid || "");
+      const status = statuses[uuid];
       return {
         uuid,
         name: String(node.name || uuid),
         ipv4: String(node.ipv4 || ""),
         ipv6: String(node.ipv6 || ""),
-        online: nodeOnline(statuses[uuid]),
+        online: statusError ? false : nodeOnline(status),
         group: String(node.group || ""),
       };
     })
@@ -74,9 +94,24 @@ async function notify(payload: NotificationPayload): Promise<void> {
   });
 }
 
+function reportStorageIssues(): void {
+  const issues = storage.drainIssues();
+  if (!issues.length) return;
+  const settings = storage.loadSettings();
+  for (const issue of issues) {
+    storage.appendLog({
+      level: "error",
+      action: "storage",
+      message: `数据文件异常：${redact(issue, settings)}`,
+    });
+  }
+  storage.flushLogs();
+}
+
 definePlugin({
   load() {
     storage.ensure();
+    reportStorageIssues();
     csrf = makeId(24);
     engine = new SyncEngine({ storage, getNodes, notify });
     registerRoutes({ server, storage, engine, getNodes, csrf });
@@ -90,11 +125,17 @@ definePlugin({
           action: "schedule",
           message: redact(errorMessage(error), settings),
         });
+        storage.flushLogs();
       }
     });
     console.log("[ddns-plus] loaded, storage:", __storageDir__);
   },
   unload() {
+    try {
+      storage.flushLogs();
+    } catch (error) {
+      console.warn("[ddns-plus] flush logs on unload failed:", errorMessage(error));
+    }
     console.log("[ddns-plus] unloaded");
   },
 });

@@ -33,6 +33,7 @@ function settings(authMode: "token" | "key" = "token"): Settings {
     paused: false,
     compareMode: "local",
     intervalMinutes: 1,
+    reconcileHours: 1,
     updatedAt: "",
   };
 }
@@ -448,5 +449,132 @@ describe("SyncEngine", () => {
     expect(job.running).toBe(false);
     expect(job.message).toContain("暂停");
     expect(mock.create).not.toHaveBeenCalled();
+  });
+
+  it("re-reads Cloudflare once the reconcile window elapses", async () => {
+    const storage = makeStorage();
+    const current = settings();
+    current.reconcileHours = 1;
+    storage.saveSettings(current);
+    storage.saveRecords([rule()]);
+    const mock = mockClient();
+    const nodes = [
+      {
+        uuid: "node-0001",
+        name: "HK1",
+        ipv4: "8.8.8.8",
+        ipv6: "",
+        online: true,
+        group: "",
+      },
+    ];
+    const first = new SyncEngine({
+      storage,
+      getNodes: async () => nodes,
+      notify: async () => undefined,
+      createClient: () => mock.client,
+    });
+    first.start();
+    await waitForIdle(first);
+    expect(first.snapshot().statuses["record-0001"].lastReconciledAt).toBeTruthy();
+
+    const stale = first.snapshot().statuses;
+    stale["record-0001"].nextRunAt = "2000-01-01T00:00:00.000Z";
+    stale["record-0001"].lastReconciledAt = "2000-01-01T00:00:00.000Z";
+    storage.saveStatuses(stale);
+
+    const zoneFor = vi.fn(async () => ({ id: "zone-1", name: "example.com", status: "active" }));
+    const listRecords = vi.fn(async () => mock.records.slice());
+    const second = new SyncEngine({
+      storage,
+      getNodes: async () => nodes,
+      notify: async () => undefined,
+      createClient: () => ({ ...mock.client, zoneFor, listRecords }),
+    });
+    second.startDue();
+    await waitForIdle(second);
+    expect(zoneFor).toHaveBeenCalledTimes(1);
+    expect(listRecords).toHaveBeenCalledTimes(1);
+    expect(second.snapshot().statuses["record-0001"].lastReconciledAt).not.toBe(
+      "2000-01-01T00:00:00.000Z",
+    );
+  });
+
+  it("repairs a DNS record deleted outside the panel during reconcile", async () => {
+    const storage = makeStorage();
+    const current = settings();
+    current.reconcileHours = 1;
+    storage.saveSettings(current);
+    storage.saveRecords([rule()]);
+    const mock = mockClient();
+    const nodes = [
+      {
+        uuid: "node-0001",
+        name: "HK1",
+        ipv4: "8.8.8.8",
+        ipv6: "",
+        online: true,
+        group: "",
+      },
+    ];
+    const first = new SyncEngine({
+      storage,
+      getNodes: async () => nodes,
+      notify: async () => undefined,
+      createClient: () => mock.client,
+    });
+    first.start();
+    await waitForIdle(first);
+    expect(mock.records).toHaveLength(1);
+
+    // 模拟面板外删除：本地状态仍是 success，只有对账能发现。
+    mock.records.length = 0;
+    const stale = first.snapshot().statuses;
+    stale["record-0001"].nextRunAt = "2000-01-01T00:00:00.000Z";
+    stale["record-0001"].lastReconciledAt = "2000-01-01T00:00:00.000Z";
+    storage.saveStatuses(stale);
+
+    const second = new SyncEngine({
+      storage,
+      getNodes: async () => nodes,
+      notify: async () => undefined,
+      createClient: () => mock.client,
+    });
+    second.startDue();
+    await waitForIdle(second);
+    expect(mock.records).toHaveLength(1);
+    expect(mock.records[0].content).toBe("8.8.8.8");
+  });
+
+  it("stops the round on the first 429 instead of hammering Cloudflare", async () => {
+    const storage = makeStorage();
+    storage.saveSettings(settings());
+    storage.saveRecords(
+      Array.from({ length: 5 }, (_value, index) => rule({ id: "record-429-" + index })),
+    );
+    const mock = mockClient();
+    const listRecords = vi.fn(async () => {
+      const { CloudflareError } = await import("../src/cloudflare");
+      throw new CloudflareError("Cloudflare API 请求受限，请稍后重试。", 429, undefined, 30000);
+    });
+    const engine = new SyncEngine({
+      storage,
+      getNodes: async () => [
+        {
+          uuid: "node-0001",
+          name: "HK1",
+          ipv4: "8.8.8.8",
+          ipv6: "",
+          online: true,
+          group: "",
+        },
+      ],
+      notify: async () => undefined,
+      createClient: () => ({ ...mock.client, listRecords }),
+    });
+    engine.start();
+    await waitForIdle(engine);
+    expect(listRecords).toHaveBeenCalledTimes(1);
+    expect(engine.snapshot().job.message).toContain("限流");
   });
 });

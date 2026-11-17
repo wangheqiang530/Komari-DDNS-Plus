@@ -140,6 +140,7 @@ let settings = {
   paused: false,
   compareMode: "local",
   intervalMinutes: 1,
+  reconcileHours: 1,
   updatedAt: new Date().toISOString(),
 };
 
@@ -284,7 +285,7 @@ const server = http.createServer(async (req, res) => {
         statuses,
         sync,
         csrf: "preview-csrf",
-        version: "0.0.4",
+        version: "0.0.5",
       });
       return;
     }
@@ -308,6 +309,10 @@ const server = http.createServer(async (req, res) => {
         notify: Boolean(body.notify),
         compareMode: body.compareMode === "cloudflare" ? "cloudflare" : "local",
         intervalMinutes: Number(body.intervalMinutes) || 1,
+        reconcileHours:
+          String(body.reconcileHours ?? "").trim() === "" || Number(body.reconcileHours) < 0
+            ? settings.reconcileHours
+            : Number(body.reconcileHours),
         updatedAt: new Date().toISOString(),
       };
       json(res, {

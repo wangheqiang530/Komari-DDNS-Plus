@@ -15,6 +15,7 @@ import {
 import {
   PluginError,
   errorMessage,
+  needsReconcile,
   nowIso,
   recordMarker,
   redact,
@@ -141,13 +142,22 @@ export class SyncEngine {
     this.deps.storage.saveStatuses(this.statuses);
   }
 
+  private persistStatuses(): void {
+    this.deps.storage.saveStatuses(this.statuses);
+  }
+
+  private log(entry: Parameters<Storage["appendLog"]>[0]): void {
+    this.deps.storage.appendLog(entry);
+  }
+
   start(ids?: string[], force = true): SyncJob {
     if (this.job.running) {
       throw new PluginError("已有同步任务正在运行，请稍后重试。", 409);
     }
-    if (Date.now() < this.blockedUntil) {
-      this.job = { ...this.job, message: "Cloudflare 限流等待中，请稍后重试。" };
-      return { ...this.job };
+    const now = Date.now();
+    if (now < this.blockedUntil) {
+      const seconds = Math.max(1, Math.ceil((this.blockedUntil - now) / 1000));
+      throw new PluginError(`Cloudflare 请求受限，请在 ${seconds} 秒后重试。`, 429);
     }
     const settings = this.deps.storage.loadSettings();
     if (!hasCredentials(settings)) {
@@ -158,11 +168,9 @@ export class SyncEngine {
     const due = records.filter((record) => {
       if (!record.enabled) return false;
       if (selectedIds && !selectedIds.has(record.id)) return false;
-      if (force || !selectedIds) {
-        if (force) return true;
-      }
+      if (force) return true;
       const next = this.statuses[record.id]?.nextRunAt;
-      return !next || Date.parse(next) <= Date.now();
+      return !next || Date.parse(next) <= now;
     });
     if (!due.length) {
       this.job = {
@@ -184,9 +192,17 @@ export class SyncEngine {
     };
     setTimeout(() => {
       void this.run(due, force).catch((error) => {
+        const message = redact(errorMessage(error), settings);
         this.job.running = false;
         this.job.finishedAt = nowIso();
-        this.job.message = redact(errorMessage(error), settings);
+        this.job.message = `同步中断：${message}`;
+        this.log({ level: "error", action: "sync", message: `同步任务异常中止：${message}` });
+        try {
+          this.persistStatuses();
+        } catch {
+          // 状态写盘失败不应掩盖原始错误。
+        }
+        this.deps.storage.flushLogs();
       });
     }, 0);
     return { ...this.job };
@@ -202,7 +218,19 @@ export class SyncEngine {
       this.job = { ...emptyJob(), message: "尚未配置 Cloudflare 凭据。" };
       return { ...this.job };
     }
-    return this.start(undefined, false);
+    if (this.job.running) {
+      // 定时触发撞上进行中的手动同步属于正常情况，不应该反复写错误日志。
+      return { ...this.job };
+    }
+    try {
+      return this.start(undefined, false);
+    } catch (error) {
+      if (error instanceof PluginError) {
+        this.job = { ...this.job, message: errorMessage(error) };
+        return { ...this.job };
+      }
+      throw error;
+    }
   }
 
   private async run(records: DdnsRecord[], forceCloudflare: boolean): Promise<void> {
@@ -212,76 +240,87 @@ export class SyncEngine {
     const client = this.deps.createClient
       ? this.deps.createClient(settings)
       : createCloudflareClient(settings);
-    const nodes = await this.deps.getNodes(Array.from(new Set(records.map((record) => record.nodeUuid))));
-    const nodeMap = new Map(nodes.map((node) => [node.uuid, node]));
+    let rateLimited = false;
 
-    for (let offset = 0; offset < records.length; offset += SYNC_CHUNK_SIZE) {
-      const chunk = records.slice(offset, offset + SYNC_CHUNK_SIZE);
-      for (const record of chunk) {
-        const previousStatus = this.statuses[record.id];
-        let result: RecordSyncResult | undefined;
-        try {
-          result = await this.syncRecord(
-            record,
-            client,
-            nodeMap,
-            settings.compareMode,
-            forceCloudflare,
-          );
-        } catch (error) {
-          const message = redact(errorMessage(error), settings);
-          if (error instanceof CloudflareError && error.status === 429) {
-            this.blockedUntil = Date.now() + (error.retryAfterMs || 60000);
+    try {
+      const nodes = await this.deps.getNodes(
+        Array.from(new Set(records.map((record) => record.nodeUuid))),
+      );
+      const nodeMap = new Map(nodes.map((node) => [node.uuid, node]));
+
+      for (let offset = 0; offset < records.length && !rateLimited; offset += SYNC_CHUNK_SIZE) {
+        const chunk = records.slice(offset, offset + SYNC_CHUNK_SIZE);
+        for (const record of chunk) {
+          const previousStatus = this.statuses[record.id];
+          let result: RecordSyncResult | undefined;
+          try {
+            result = await this.syncRecord(record, client, nodeMap, settings, forceCloudflare);
+          } catch (error) {
+            const message = redact(errorMessage(error), settings);
+            this.statuses[record.id] = statusForRecord(record, "error", {
+              action: "error",
+              lastError: message,
+            });
+            this.job.errors += 1;
+            if (previousStatus?.state !== "error") {
+              this.failures.push({
+                record,
+                nodeName: nodeMap.get(record.nodeUuid)?.name || record.nodeUuid,
+                message,
+              });
+            }
+            this.log({
+              level: "error",
+              action: "sync",
+              message,
+              domain: record.domain,
+              type: record.type,
+              nodeUuid: record.nodeUuid,
+            });
+            if (error instanceof CloudflareError && error.status === 429) {
+              this.blockedUntil = Date.now() + (error.retryAfterMs || 60000);
+              rateLimited = true;
+              this.job.completed += 1;
+              break;
+            }
           }
-          this.statuses[record.id] = statusForRecord(record, "error", {
-            action: "error",
-            lastError: message,
-          });
-          this.job.errors += 1;
-          if (previousStatus?.state !== "error") {
-            this.failures.push({
+          if (
+            result?.changed &&
+            (result.action === "created" ||
+              (result.action === "updated" && result.previousIp !== result.currentIp))
+          ) {
+            this.changes.push({
               record,
               nodeName: nodeMap.get(record.nodeUuid)?.name || record.nodeUuid,
-              message,
+              previousIp: result.previousIp,
+              currentIp: result.currentIp || "",
+              action: result.action,
             });
           }
-          this.deps.storage.appendLog({
-            level: "error",
-            action: "sync",
-            message,
-            domain: record.domain,
-            type: record.type,
-            nodeUuid: record.nodeUuid,
-          });
+          this.job.completed += 1;
         }
-        if (
-          result?.changed &&
-          (result.action === "created" || result.action === "updated") &&
-          (result.action === "created" || result.previousIp !== result.currentIp)
-        ) {
-          this.changes.push({
-            record,
-            nodeName: nodeMap.get(record.nodeUuid)?.name || record.nodeUuid,
-            previousIp: result.previousIp,
-            currentIp: result.currentIp || "",
-            action: result.action,
-          });
-        }
-        this.job.completed += 1;
+        this.persistStatuses();
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
-      this.deps.storage.saveStatuses(this.statuses);
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    }
-
-    this.job.running = false;
-    this.job.finishedAt = nowIso();
-    this.job.message = `同步完成：共 ${this.job.total} 条，变更 ${this.job.changed} 条，跳过 ${this.job.skipped} 条，失败 ${this.job.errors} 条。`;
-    if (this.job.changed > 0 || this.job.errors > 0) {
-      this.deps.storage.appendLog({
-        level: this.job.errors ? "warning" : "success",
-        action: "sync",
-        message: this.job.message,
-      });
+    } finally {
+      this.job.running = false;
+      this.job.finishedAt = nowIso();
+      const blockedNote = rateLimited ? "；触发 Cloudflare 限流，本轮提前结束" : "";
+      this.job.message =
+        `同步结束：本轮处理 ${this.job.completed}/${this.job.total} 条，变更 ${this.job.changed} 条，跳过 ${this.job.skipped} 条，失败 ${this.job.errors} 条${blockedNote}。`;
+      if (this.job.changed > 0 || this.job.errors > 0 || rateLimited) {
+        this.log({
+          level: rateLimited || this.job.errors ? "warning" : "success",
+          action: "sync",
+          message: this.job.message,
+        });
+      }
+      try {
+        this.persistStatuses();
+      } catch {
+        // 状态写盘失败不应掩盖同步结果。
+      }
+      this.deps.storage.flushLogs();
     }
 
     await this.sendNotificationSummary(settings);
@@ -331,19 +370,20 @@ export class SyncEngine {
         clients,
       });
     } catch (error) {
-      this.deps.storage.appendLog({
+      this.log({
         level: "warning",
         action: "notify",
         message: `通知发送失败：${redact(errorMessage(error), settings)}`,
       });
+      this.deps.storage.flushLogs();
     }
   }
 
   private async syncRecord(
     record: DdnsRecord,
-    client: ReturnType<typeof createCloudflareClient>,
+    client: CloudflareClient,
     nodes: Map<string, NodeInfo>,
-    compareMode: Settings["compareMode"],
+    settings: Settings,
     forceCloudflare: boolean,
   ): Promise<RecordSyncResult> {
     if (!record.enabled) {
@@ -358,35 +398,43 @@ export class SyncEngine {
     if (!node) {
       throw new PluginError("所选节点已删除或无法读取。", 422);
     }
+    const previous = this.statuses[record.id];
     if (!node.online) {
       this.statuses[record.id] = statusForRecord(record, "skipped", {
         action: "skipped",
+        currentIp: previous?.currentIp,
+        recordId: previous?.recordId,
         lastError: "节点离线，保留现有 DNS 记录。",
+        lastReconciledAt: previous?.lastReconciledAt,
       });
       this.job.skipped += 1;
-      this.deps.storage.appendLog({
-        level: "info",
-        action: "sync",
-        message: "节点离线，跳过同步。",
-        domain: record.domain,
-        type: record.type,
-        nodeUuid: record.nodeUuid,
-      });
+      // 只在状态发生转换时写日志，避免长期离线节点每轮刷屏。
+      if (previous?.state !== "skipped") {
+        this.log({
+          level: "info",
+          action: "sync",
+          message: "节点离线，跳过同步。",
+          domain: record.domain,
+          type: record.type,
+          nodeUuid: record.nodeUuid,
+        });
+      }
       return { changed: false, action: "skipped" };
     }
 
     const ip = validateAddress(record.type === "A" ? node.ipv4 : node.ipv6, record.type);
     const effectiveTtl = record.proxied ? 1 : record.ttl;
-    const previous = this.statuses[record.id];
-    if (
+    const reconcile = needsReconcile(previous, settings.reconcileHours, record.id);
+    const canSkipCloudflare =
       !forceCloudflare &&
-      compareMode === "local" &&
+      !reconcile &&
+      settings.compareMode === "local" &&
       previous?.state === "success" &&
       previous.currentIp === ip &&
       previous.recordId &&
       previous.syncedTtl === effectiveTtl &&
-      previous.syncedProxied === record.proxied
-    ) {
+      previous.syncedProxied === record.proxied;
+    if (canSkipCloudflare) {
       this.statuses[record.id] = statusForRecord(record, "success", {
         action: "unchanged",
         currentIp: ip,
@@ -395,10 +443,12 @@ export class SyncEngine {
         lastChangedAt: previous.lastChangedAt,
         syncedTtl: effectiveTtl,
         syncedProxied: record.proxied,
+        lastReconciledAt: previous.lastReconciledAt,
       });
       this.job.skipped += 1;
       return { changed: false, action: "unchanged", previousIp: ip, currentIp: ip };
     }
+
     const zone = await client.zoneFor(record.domain);
     const existing = await client.listRecords(zone.id, record.domain, record.type);
     const marker = recordMarker(record.id);
@@ -410,8 +460,8 @@ export class SyncEngine {
     }
 
     let current: CloudflareRecord | undefined = managed[0];
-    if (!current && this.statuses[record.id]?.recordId) {
-      current = existing.find((item) => item.id === this.statuses[record.id]?.recordId);
+    if (!current && previous?.recordId) {
+      current = existing.find((item) => item.id === previous.recordId);
     }
 
     if (!current) {
@@ -433,7 +483,7 @@ export class SyncEngine {
     if (!current) {
       const unmanaged = existing.filter((item) => !String(item.comment || "").startsWith("komari-ddns-plus:"));
       if (unmanaged.length > 0) {
-        if (!record.adoptExisting || unmanaged.length !== 1 || unmanaged[0].comment) {
+        if (!record.adoptExisting || unmanaged.length !== 1) {
           throw new PluginError(
             "目标域名已有非本插件管理的同类型记录，已停止覆盖。可先整理记录，或启用“接管唯一已有记录”。",
             422,
@@ -459,14 +509,16 @@ export class SyncEngine {
       Boolean(current.proxied) === payload.proxied &&
       current.comment === marker
     ) {
+      const reconciledAt = nowIso();
       this.statuses[record.id] = statusForRecord(record, "success", {
         action: "unchanged",
         currentIp: ip,
         recordId: current.id,
-        lastSuccessAt: nowIso(),
-        lastChangedAt: this.statuses[record.id]?.lastChangedAt,
+        lastSuccessAt: reconciledAt,
+        lastChangedAt: previous?.lastChangedAt,
         syncedTtl: payload.ttl,
         syncedProxied: record.proxied,
+        lastReconciledAt: reconciledAt,
       });
       this.job.skipped += 1;
       return {
@@ -489,9 +541,10 @@ export class SyncEngine {
       lastChangedAt: changedAt,
       syncedTtl: payload.ttl,
       syncedProxied: record.proxied,
+      lastReconciledAt: changedAt,
     });
     this.job.changed += 1;
-    this.deps.storage.appendLog({
+    this.log({
       level: "success",
       action: current ? "update" : "create",
       message: `${current ? "更新" : "创建"} ${record.type} 记录为 ${ip}`,

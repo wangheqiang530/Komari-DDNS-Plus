@@ -29,6 +29,8 @@ export const MAX_RECORDS = 1000;
 export const MAX_DOMAINS_PER_BATCH = 100;
 export const MAX_NODES_PER_BATCH = 50;
 export const MAX_LOGS = 1000;
+export const RECONCILE_MAX_HOURS = 720;
+export const RECONCILE_DEFAULT_HOURS = 1;
 export const RECORD_MARKER_PREFIX = "komari-ddns-plus:";
 
 export interface Settings {
@@ -41,6 +43,7 @@ export interface Settings {
   paused: boolean;
   compareMode: CompareMode;
   intervalMinutes: number;
+  reconcileHours: number;
   updatedAt: string;
 }
 
@@ -53,6 +56,7 @@ export interface PublicSettings {
   paused: boolean;
   compareMode: CompareMode;
   intervalMinutes: number;
+  reconcileHours: number;
   updatedAt: string;
 }
 
@@ -98,6 +102,7 @@ export interface RecordStatus {
   nextRunAt?: string;
   syncedTtl?: number;
   syncedProxied?: boolean;
+  lastReconciledAt?: string;
 }
 
 export interface SyncJob {

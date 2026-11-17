@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.0.5
+
+- Add a configurable periodic reconcile (default 1 hour, in hours, 0 disables) so records deleted or edited outside the panel are repaired even when the node IP never changes; each record reconciles on its own jittered window.
+- Stop the sync round at the first Cloudflare 429 instead of continuing through every remaining record.
+- Report rate limiting as a failure with HTTP 429 instead of a success message, in both the API and the panel.
+- Keep a backup of a corrupt records/settings/status file instead of silently overwriting it, and surface the problem in the logs.
+- Fix the silent abort when a sync round throws: the error is now logged and pending statuses are persisted.
+- Enforce the 1000 record limit when updating a rule group.
+- Treat an unknown node status as offline instead of online, so a failed status RPC can no longer push stale IPs to DNS.
+- Allow adopting a single existing record that already carries a comment.
+- Reuse the Cloudflare zone list across sync rounds and keep paused zones instead of reporting a missing zone.
+- Only log an offline node when it transitions to offline instead of on every round.
+- Flush logs once per batch instead of rewriting the whole log file for every entry, and fsync data files before rename.
+- Fix the log API reporting the page size as the total count.
+- Refresh the node list while the panel is open, and add request timeouts to the panel API calls.
+- Ignore scheduled-sync 409 conflicts instead of writing an error log on every tick.
+- Redact secrets from API error responses and use a constant-time CSRF comparison.
+
 ## 0.0.4
 
 - Show the existing rule count on each node in the node picker.

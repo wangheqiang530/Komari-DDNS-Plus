@@ -131,6 +131,22 @@ describe("domain and settings validation", () => {
     ).toThrow(/代理开关/);
   });
 
+  it("validates the reconcile interval in hours", () => {
+    const base = { authMode: "token", token: "t".repeat(40) };
+    expect(normalizeSettings({ ...base }).reconcileHours).toBe(1);
+    expect(normalizeSettings({ ...base, reconcileHours: 0 }).reconcileHours).toBe(0);
+    expect(normalizeSettings({ ...base, reconcileHours: "6" }).reconcileHours).toBe(6);
+    expect(normalizeSettings({ ...base, reconcileHours: 2.5 }).reconcileHours).toBe(2.5);
+    expect(normalizeSettings({ ...base, reconcileHours: 720 }).reconcileHours).toBe(720);
+    expect(() => normalizeSettings({ ...base, reconcileHours: -1 })).toThrow(/0 到 720/);
+    expect(() => normalizeSettings({ ...base, reconcileHours: 721 })).toThrow(/0 到 720/);
+    expect(() => normalizeSettings({ ...base, reconcileHours: "abc" })).toThrow(/0 到 720/);
+    expect(() => normalizeSettings({ ...base, reconcileHours: 0.001 })).toThrow(/不能小于 1 分钟/);
+    // 留空表示沿用上一个值，而不是重置成默认值。
+    const saved = normalizeSettings({ ...base, reconcileHours: 8 });
+    expect(normalizeSettings({ ...base, reconcileHours: "" }, saved).reconcileHours).toBe(8);
+  });
+
   it("validates the IP comparison mode", () => {
     const settings = normalizeSettings({
       authMode: "token",

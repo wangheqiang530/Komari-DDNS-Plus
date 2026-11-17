@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
-import { CloudflareError, createCloudflareClient } from "../src/cloudflare";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CloudflareError, createCloudflareClient, resetZoneCache } from "../src/cloudflare";
 
 function jsonResponse(value: unknown, status = 200, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify(value), {
@@ -9,6 +9,8 @@ function jsonResponse(value: unknown, status = 200, headers?: Record<string, str
 }
 
 describe("Cloudflare client", () => {
+  beforeEach(() => resetZoneCache());
+
   it("uses Bearer authentication for API tokens", async () => {
     const fetcher = vi
       .fn<typeof fetch>()
@@ -150,6 +152,23 @@ describe("Cloudflare client", () => {
     const error = await client.test().catch((caught) => caught);
     expect(error).toBeInstanceOf(CloudflareError);
     expect(error.message).toContain("Zone > DNS > Edit");
+  });
+
+  it("keeps paused zones usable instead of reporting a missing zone", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jsonResponse({
+        success: true,
+        result: [{ id: "zone-paused", name: "paused.example.com", status: "paused" }],
+        result_info: { total_pages: 1 },
+      }),
+    );
+    const client = createCloudflareClient(
+      { authMode: "token", token: "t".repeat(40), email: "", apiKey: "" },
+      fetcher,
+    );
+    const zone = await client.zoneFor("home.paused.example.com");
+    expect(zone.id).toBe("zone-paused");
+    expect(await client.listZones()).toHaveLength(1);
   });
 
   it("selects the longest matching zone", async () => {

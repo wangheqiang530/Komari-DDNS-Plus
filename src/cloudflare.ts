@@ -9,6 +9,23 @@ import { PluginError, errorMessage, normalizeDomain } from "./util";
 const CF_API = "https://api.cloudflare.com/client/v4";
 const ZONE_CACHE_MS = 5 * 60 * 1000;
 
+// Zone 列表按「凭据指纹」缓存在模块级：同一轮同步里的多个记录共享同一次拉取。
+let zoneCache: { key: string; at: number; zones: CloudflareZone[] } | null = null;
+
+function authFingerprint(auth: AuthCredentials): string {
+  const material =
+    auth.authMode === "token" ? `token:${auth.token}` : `key:${auth.email}:${auth.apiKey}`;
+  let hash = 5381;
+  for (let index = 0; index < material.length; index++) {
+    hash = ((hash << 5) + hash + material.charCodeAt(index)) >>> 0;
+  }
+  return `${auth.authMode}:${hash.toString(16)}`;
+}
+
+export function resetZoneCache(): void {
+  zoneCache = null;
+}
+
 interface CloudflareErrorBody {
   code?: number;
   message?: string;
@@ -139,7 +156,7 @@ export function createCloudflareClient(
   fetcher: typeof fetch = fetch,
   now: () => number = Date.now,
 ): CloudflareClient {
-  let zoneCache: { at: number; zones: CloudflareZone[] } | null = null;
+  const cacheKey = authFingerprint(auth);
 
   async function request<T>(
     path: string,
@@ -186,7 +203,9 @@ export function createCloudflareClient(
   }
 
   async function listZones(): Promise<CloudflareZone[]> {
-    if (zoneCache && now() - zoneCache.at < ZONE_CACHE_MS) return zoneCache.zones;
+    if (zoneCache && zoneCache.key === cacheKey && now() - zoneCache.at < ZONE_CACHE_MS) {
+      return zoneCache.zones;
+    }
     const zones: CloudflareZone[] = [];
     for (let page = 1; page <= 100; page++) {
       const data = await request<CloudflareZone[]>(
@@ -196,9 +215,10 @@ export function createCloudflareClient(
       const totalPages = Number(data.result_info?.total_pages || 1);
       if (page >= totalPages) break;
     }
-    const active = zones.filter((zone) => zone.status === "active");
-    zoneCache = { at: now(), zones: active };
-    return active;
+    // 保留 paused / pending 等非 active 状态：它们的 DNS 记录依然可读可写，
+    // 过滤掉只会把「Zone 被暂停」误报成「找不到 Zone」。
+    zoneCache = { key: cacheKey, at: now(), zones };
+    return zones;
   }
 
   async function zoneFor(domain: string): Promise<CloudflareZone> {
@@ -207,7 +227,8 @@ export function createCloudflareClient(
     const zones = await listZones();
     for (let index = 0; index < labels.length - 1; index++) {
       const candidate = labels.slice(index).join(".");
-      const zone = zones.find((item) => item.name.toLowerCase() === candidate);
+      const matches = zones.filter((item) => item.name.toLowerCase() === candidate);
+      const zone = matches.find((item) => item.status === "active") || matches[0];
       if (zone) return zone;
     }
     throw new PluginError(

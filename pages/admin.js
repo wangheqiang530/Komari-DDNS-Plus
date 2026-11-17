@@ -336,29 +336,56 @@
     });
   }
 
+  var API_TIMEOUT_MS = 20000;
+  var API_TIMEOUT_LONG_MS = 90000;
+
   function api(path, options) {
     options = options || {};
     var method = options.method || "GET";
     var headers = Object.assign({}, options.headers || {});
     if (method !== "GET") headers["X-Komari-DDNS-Plus-CSRF"] = state.csrf;
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
-    return fetch(API_BASE + path, {
+    var controller = typeof AbortController === "function" ? new AbortController() : null;
+    var timeoutMs = options.timeoutMs || API_TIMEOUT_MS;
+    var timer = null;
+    if (controller) {
+      timer = setTimeout(function () {
+        controller.abort();
+      }, timeoutMs);
+    }
+    var request = {
       method: method,
       credentials: "same-origin",
       cache: "no-store",
       headers: headers,
       body: options.body,
-    }).then(function (response) {
-      return response
-        .json()
-        .catch(function () {
-          return {};
-        })
-        .then(function (data) {
-          if (!response.ok) throw new Error(data.error || "请求失败（HTTP " + response.status + "）");
-          return data;
-        });
-    });
+    };
+    if (controller) request.signal = controller.signal;
+    return fetch(API_BASE + path, request)
+      .catch(function (error) {
+        if (error && error.name === "AbortError") {
+          throw new Error("请求超时，请稍后重试。");
+        }
+        throw error;
+      })
+      .then(function (response) {
+        return response
+          .json()
+          .catch(function () {
+            return {};
+          })
+          .then(function (data) {
+            if (!response.ok) {
+              var failure = new Error(data.error || "请求失败（HTTP " + response.status + "）");
+              failure.status = response.status;
+              throw failure;
+            }
+            return data;
+          });
+      })
+      .finally(function () {
+        if (timer) clearTimeout(timer);
+      });
   }
 
   function applyState(data) {
@@ -691,6 +718,9 @@
     byId("settings-interval").value = String(settings.intervalMinutes || 1);
     byId("notify").checked = Boolean(settings.notify);
     byId("compare-mode").value = settings.compareMode || "local";
+    byId("reconcile-hours").value = String(
+      typeof settings.reconcileHours === "number" ? settings.reconcileHours : 1
+    );
     updateCompareModeHelp();
     byId("token").value = "";
     byId("api-key").value = "";
@@ -827,6 +857,7 @@
       applyState(values[0]);
       state.authMode = state.settings.authMode || "token";
       state.nodes = Array.isArray(values[1]) ? values[1] : [];
+      nodesFetchedAt = Date.now();
       renderAll();
       var requested = new URLSearchParams(location.search).get("panel");
       if (requested === "records" || requested === "settings" || requested === "logs") {
@@ -837,12 +868,30 @@
     });
   }
 
+  var NODE_REFRESH_MS = 30000;
+  var nodesFetchedAt = 0;
+
+  function refreshNodesIfStale() {
+    // 节点列表变化很慢（agent 5 分钟才上报一次信息），不必跟着 4 秒轮询走。
+    if (Date.now() - nodesFetchedAt < NODE_REFRESH_MS) return Promise.resolve();
+    return api("/nodes")
+      .then(function (nodes) {
+        state.nodes = Array.isArray(nodes) ? nodes : [];
+        nodesFetchedAt = Date.now();
+      })
+      .catch(function () {
+        /* 节点列表刷新失败时保留旧数据，不打断面板刷新 */
+      });
+  }
+
   function refreshState() {
     return api("/state").then(function (data) {
       applyState(data);
-      renderHeader();
-      renderNodes();
-      renderGroups();
+      return refreshNodesIfStale().then(function () {
+        renderHeader();
+        renderNodes();
+        renderGroups();
+      });
     });
   }
 
@@ -903,6 +952,7 @@
       intervalMinutes: Number(byId("settings-interval").value),
       notify: byId("notify").checked,
       compareMode: byId("compare-mode").value,
+      reconcileHours: byId("reconcile-hours").value.trim(),
     };
     api("/settings", { method: "POST", body: JSON.stringify(payload) })
       .then(function (data) {
@@ -923,6 +973,7 @@
     result.className = "test-result";
     api("/settings/test", {
       method: "POST",
+      timeoutMs: API_TIMEOUT_LONG_MS,
       body: JSON.stringify({
         authMode: state.authMode,
         email: byId("email").value,
@@ -997,17 +1048,25 @@
   function syncAll() {
     api("/sync", { method: "POST", body: JSON.stringify({ force: true }) })
       .then(function (data) {
-        state.sync = data.job || state.sync;
+        var job = data.job || state.sync;
+        state.sync = job || state.sync;
         renderHeader();
-        showToast(data.job && data.job.message ? data.job.message : "同步任务已启动。", "success");
+        if (job.running) {
+          showToast(job.message || "同步任务已启动。", "success");
+        } else {
+          // 未真正启动（暂停/无凭据/限流等待）时不能报成功。
+          showToast(job.message || "同步任务未能启动。", "error");
+        }
       })
       .catch(function (error) { showToast(error.message, "error"); });
   }
 
   function syncGroup(groupId) {
     api("/sync", { method: "POST", body: JSON.stringify({ groupIds: [groupId], force: true }) })
-      .then(function () {
-        showToast("同步任务已启动。", "success");
+      .then(function (data) {
+        var job = data.job || {};
+        if (job.running) showToast(job.message || "同步任务已启动。", "success");
+        else showToast(job.message || "同步任务未能启动。", "error");
         refreshState();
       })
       .catch(function (error) { showToast(error.message, "error"); });

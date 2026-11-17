@@ -2,7 +2,7 @@
 
 Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 Komari 节点上报的 IPv4/IPv6 地址，批量维护 Cloudflare DNS 记录。
 
-当前版本：`0.0.4`
+当前版本：`0.0.5`
 
 ## 功能
 
@@ -21,8 +21,9 @@ Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 K
 - 规则组状态、目标级当前 IP、上次同步时间和错误信息。
 - 批量启用、停用、删除和立即同步。
 - 全局暂停或恢复计划同步，手动同步不受影响。
-- Cloudflare Zone 自动匹配和 5 分钟缓存。
-- 429 限流识别、分块同步和状态持久化。
+- Cloudflare Zone 自动匹配和 5 分钟缓存（跨同步轮次共享）。
+- 429 限流识别：命中后立即结束本轮，不再继续请求后续记录。
+- 可配置的定期强制同步（默认 1 小时），修复面板外被删改的记录。
 - 运行日志和带节点、域名、类型、IP 明细的变更通知。
 - 仅 IP 变更或失败状态开始时通知，持续失败不会反复发送。
 - 自动迁移 v0.0.1 的平铺记录为节点规则组。
@@ -38,7 +39,7 @@ Komari DDNS Plus 是一个面向 Komari 的 Cloudflare DDNS 插件。它读取 K
 
 ## 安装
 
-1. 在 GitHub Releases 下载 `ddns-plus-0.0.4.zip`。
+1. 在 GitHub Releases 下载 `ddns-plus-0.0.5.zip`。
 2. 在 Komari 后台的插件管理页面上传 ZIP。
 3. 启用插件并批准系统 RPC 和 HTTP 路由权限。
 4. 打开后台侧边栏的 **DDNS Plus** 页面。
@@ -108,7 +109,7 @@ npm run pack
 生成的安装包：
 
 ```text
-dist/ddns-plus-0.0.4.zip
+dist/ddns-plus-0.0.5.zip
 ```
 
 管理页本地预览地址：
@@ -133,7 +134,7 @@ http://127.0.0.1:18795/pages/admin.html
 npm run dev
 ```
 
-## v0.0.4 限制
+## v0.0.5 限制
 
 - 删除规则组时暂不提供 Cloudflare DNS 记录清理。
 - 暂不支持在规则组内单独编辑某个域名目标。
@@ -142,10 +143,22 @@ npm run dev
 
 ## IP 对比方式
 
-- **本地缓存对比（默认）**：先对比 Komari 节点 IP 与上次成功推送的 IP。IP、TTL 和代理状态都没有变化时，不访问 Cloudflare DNS 接口。适合大多数 DDNS 场景，但不会发现 Cloudflare 端被外部修改的记录；手动同步会强制检查。
+- **本地缓存对比（默认）**：先对比 Komari 节点 IP 与上次成功推送的 IP。IP、TTL 和代理状态都没有变化时，不访问 Cloudflare DNS 接口。适合大多数 DDNS 场景。
 - **Cloudflare 面板对比**：每次检查都读取 Cloudflare DNS 记录并对比，可以发现 Cloudflare 端被外部修改的 IP，但请求次数更多。
 
 手动点击“立即同步”会强制读取 Cloudflare 记录，不受本地缓存跳过逻辑影响。
+
+## 定期强制同步
+
+本地缓存对比不会每轮都读取 Cloudflare，因此 Cloudflare 上被外部删除或改写的记录只能靠定期对账发现。设置页的 **定期强制同步** 控制这个周期：
+
+- 单位是小时，默认 `1`，最大 `720`；小于 1 分钟的非零值会被拒绝。
+- 填 `0` 关闭对账，行为退回 v0.0.4 的纯本地缓存对比。
+- 到期后即使节点 IP 没有变化，也会回读该条记录的 Cloudflare 状态并修正差异。
+- 每条记录按自身 ID 哈希落在 ±10% 的窗口内，1000 条记录不会在同一时刻同时打 Cloudflare。
+- 只有对账成功才更新对账时间；Cloudflare 故障时下一轮会继续重试。
+
+请求预算参考：22 个节点 × 2 个域名 = 44 条记录时，Cloudflare 面板对比约 5280 次请求/小时，本地缓存对比加 1 小时对账约 132 次/天。
 
 ## License
 

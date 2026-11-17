@@ -467,6 +467,8 @@
   var MAX_DOMAINS_PER_BATCH = 100;
   var MAX_NODES_PER_BATCH = 50;
   var MAX_LOGS = 1e3;
+  var RECONCILE_MAX_HOURS = 720;
+  var RECONCILE_DEFAULT_HOURS = 1;
 
   // src/util.ts
   var PluginError = class extends Error {
@@ -575,6 +577,10 @@
     if (raw.paused !== void 0 && typeof raw.paused !== "boolean") {
       throw new PluginError("\u6682\u505C\u5F00\u5173\u683C\u5F0F\u65E0\u6548\u3002");
     }
+    const reconcileHours = normalizeReconcileHours(
+      raw.reconcileHours,
+      previous?.reconcileHours ?? RECONCILE_DEFAULT_HOURS
+    );
     return {
       version: 1,
       authMode,
@@ -585,6 +591,7 @@
       paused: raw.paused === void 0 ? Boolean(previous?.paused) : Boolean(raw.paused),
       compareMode,
       intervalMinutes,
+      reconcileHours,
       updatedAt: nowIso()
     };
   }
@@ -614,8 +621,29 @@
       paused: settings.paused,
       compareMode: settings.compareMode,
       intervalMinutes: settings.intervalMinutes,
+      reconcileHours: settings.reconcileHours,
       updatedAt: settings.updatedAt
     };
+  }
+  function normalizeReconcileHours(value, fallback) {
+    if (value === void 0 || value === null || value === "") return fallback;
+    const hours = Number(value);
+    if (!Number.isFinite(hours) || hours < 0 || hours > RECONCILE_MAX_HOURS) {
+      throw new PluginError(`\u5B9A\u671F\u5F3A\u5236\u540C\u6B65\u95F4\u9694\u5FC5\u987B\u662F 0 \u5230 ${RECONCILE_MAX_HOURS} \u4E4B\u95F4\u7684\u5C0F\u65F6\u6570\u3002`);
+    }
+    if (hours > 0 && hours < 1 / 60) {
+      throw new PluginError("\u5B9A\u671F\u5F3A\u5236\u540C\u6B65\u95F4\u9694\u4E0D\u80FD\u5C0F\u4E8E 1 \u5206\u949F\uFF1B\u5982\u9700\u505C\u6B62\u5BF9\u8D26\u8BF7\u586B 0\u3002");
+    }
+    return Math.round(hours * 60) / 60;
+  }
+  function needsReconcile(status, hours, recordId, now = Date.now()) {
+    if (!Number.isFinite(hours) || hours <= 0) return false;
+    const last = status?.lastReconciledAt ? Date.parse(status.lastReconciledAt) : NaN;
+    if (!Number.isFinite(last)) return true;
+    const hash = [...recordId].reduce((acc, char) => acc * 31 + char.charCodeAt(0) >>> 0, 0);
+    const jitter = hash % 200 / 1e3 - 0.1;
+    const windowMs = hours * 36e5 * (1 + jitter);
+    return now - last >= windowMs;
   }
   function normalizeTtl(value, proxied) {
     const ttl = Number(value);
@@ -713,6 +741,15 @@
   // src/cloudflare.ts
   var CF_API = "https://api.cloudflare.com/client/v4";
   var ZONE_CACHE_MS = 5 * 60 * 1e3;
+  var zoneCache = null;
+  function authFingerprint(auth) {
+    const material = auth.authMode === "token" ? `token:${auth.token}` : `key:${auth.email}:${auth.apiKey}`;
+    let hash = 5381;
+    for (let index = 0; index < material.length; index++) {
+      hash = (hash << 5) + hash + material.charCodeAt(index) >>> 0;
+    }
+    return `${auth.authMode}:${hash.toString(16)}`;
+  }
   var CloudflareError = class extends PluginError {
     constructor(message, status = 502, code, retryAfterMs) {
       super(message, status, code);
@@ -788,7 +825,7 @@
     return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : void 0;
   }
   function createCloudflareClient(auth, fetcher = fetch, now = Date.now) {
-    let zoneCache = null;
+    const cacheKey = authFingerprint(auth);
     async function request(path2, init = {}) {
       const headers = {
         Accept: "application/json",
@@ -827,7 +864,9 @@
       return data;
     }
     async function listZones() {
-      if (zoneCache && now() - zoneCache.at < ZONE_CACHE_MS) return zoneCache.zones;
+      if (zoneCache && zoneCache.key === cacheKey && now() - zoneCache.at < ZONE_CACHE_MS) {
+        return zoneCache.zones;
+      }
       const zones = [];
       for (let page = 1; page <= 100; page++) {
         const data = await request(
@@ -837,9 +876,8 @@
         const totalPages = Number(data.result_info?.total_pages || 1);
         if (page >= totalPages) break;
       }
-      const active = zones.filter((zone) => zone.status === "active");
-      zoneCache = { at: now(), zones: active };
-      return active;
+      zoneCache = { key: cacheKey, at: now(), zones };
+      return zones;
     }
     async function zoneFor(domain) {
       const normalized = normalizeDomain(domain).replace(/^\*\./, "");
@@ -847,7 +885,8 @@
       const zones = await listZones();
       for (let index = 0; index < labels.length - 1; index++) {
         const candidate = labels.slice(index).join(".");
-        const zone = zones.find((item) => item.name.toLowerCase() === candidate);
+        const matches = zones.filter((item) => item.name.toLowerCase() === candidate);
+        const zone = matches.find((item) => item.status === "active") || matches[0];
         if (zone) return zone;
       }
       throw new PluginError(
@@ -1037,13 +1076,20 @@
       for (const id of ids) delete this.statuses[id];
       this.deps.storage.saveStatuses(this.statuses);
     }
+    persistStatuses() {
+      this.deps.storage.saveStatuses(this.statuses);
+    }
+    log(entry) {
+      this.deps.storage.appendLog(entry);
+    }
     start(ids, force = true) {
       if (this.job.running) {
         throw new PluginError("\u5DF2\u6709\u540C\u6B65\u4EFB\u52A1\u6B63\u5728\u8FD0\u884C\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002", 409);
       }
-      if (Date.now() < this.blockedUntil) {
-        this.job = { ...this.job, message: "Cloudflare \u9650\u6D41\u7B49\u5F85\u4E2D\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002" };
-        return { ...this.job };
+      const now = Date.now();
+      if (now < this.blockedUntil) {
+        const seconds = Math.max(1, Math.ceil((this.blockedUntil - now) / 1e3));
+        throw new PluginError(`Cloudflare \u8BF7\u6C42\u53D7\u9650\uFF0C\u8BF7\u5728 ${seconds} \u79D2\u540E\u91CD\u8BD5\u3002`, 429);
       }
       const settings = this.deps.storage.loadSettings();
       if (!hasCredentials(settings)) {
@@ -1054,11 +1100,9 @@
       const due = records.filter((record) => {
         if (!record.enabled) return false;
         if (selectedIds && !selectedIds.has(record.id)) return false;
-        if (force || !selectedIds) {
-          if (force) return true;
-        }
+        if (force) return true;
         const next = this.statuses[record.id]?.nextRunAt;
-        return !next || Date.parse(next) <= Date.now();
+        return !next || Date.parse(next) <= now;
       });
       if (!due.length) {
         this.job = {
@@ -1079,9 +1123,16 @@
       };
       setTimeout(() => {
         void this.run(due, force).catch((error) => {
+          const message = redact(errorMessage(error), settings);
           this.job.running = false;
           this.job.finishedAt = nowIso();
-          this.job.message = redact(errorMessage(error), settings);
+          this.job.message = `\u540C\u6B65\u4E2D\u65AD\uFF1A${message}`;
+          this.log({ level: "error", action: "sync", message: `\u540C\u6B65\u4EFB\u52A1\u5F02\u5E38\u4E2D\u6B62\uFF1A${message}` });
+          try {
+            this.persistStatuses();
+          } catch {
+          }
+          this.deps.storage.flushLogs();
         });
       }, 0);
       return { ...this.job };
@@ -1096,77 +1147,97 @@
         this.job = { ...emptyJob(), message: "\u5C1A\u672A\u914D\u7F6E Cloudflare \u51ED\u636E\u3002" };
         return { ...this.job };
       }
-      return this.start(void 0, false);
+      if (this.job.running) {
+        return { ...this.job };
+      }
+      try {
+        return this.start(void 0, false);
+      } catch (error) {
+        if (error instanceof PluginError) {
+          this.job = { ...this.job, message: errorMessage(error) };
+          return { ...this.job };
+        }
+        throw error;
+      }
     }
     async run(records, forceCloudflare) {
       const settings = this.deps.storage.loadSettings();
       this.changes = [];
       this.failures = [];
       const client = this.deps.createClient ? this.deps.createClient(settings) : createCloudflareClient(settings);
-      const nodes = await this.deps.getNodes(Array.from(new Set(records.map((record) => record.nodeUuid))));
-      const nodeMap = new Map(nodes.map((node) => [node.uuid, node]));
-      for (let offset = 0; offset < records.length; offset += SYNC_CHUNK_SIZE) {
-        const chunk = records.slice(offset, offset + SYNC_CHUNK_SIZE);
-        for (const record of chunk) {
-          const previousStatus = this.statuses[record.id];
-          let result;
-          try {
-            result = await this.syncRecord(
-              record,
-              client,
-              nodeMap,
-              settings.compareMode,
-              forceCloudflare
-            );
-          } catch (error) {
-            const message = redact(errorMessage(error), settings);
-            if (error instanceof CloudflareError && error.status === 429) {
-              this.blockedUntil = Date.now() + (error.retryAfterMs || 6e4);
+      let rateLimited = false;
+      try {
+        const nodes = await this.deps.getNodes(
+          Array.from(new Set(records.map((record) => record.nodeUuid)))
+        );
+        const nodeMap = new Map(nodes.map((node) => [node.uuid, node]));
+        for (let offset = 0; offset < records.length && !rateLimited; offset += SYNC_CHUNK_SIZE) {
+          const chunk = records.slice(offset, offset + SYNC_CHUNK_SIZE);
+          for (const record of chunk) {
+            const previousStatus = this.statuses[record.id];
+            let result;
+            try {
+              result = await this.syncRecord(record, client, nodeMap, settings, forceCloudflare);
+            } catch (error) {
+              const message = redact(errorMessage(error), settings);
+              this.statuses[record.id] = statusForRecord(record, "error", {
+                action: "error",
+                lastError: message
+              });
+              this.job.errors += 1;
+              if (previousStatus?.state !== "error") {
+                this.failures.push({
+                  record,
+                  nodeName: nodeMap.get(record.nodeUuid)?.name || record.nodeUuid,
+                  message
+                });
+              }
+              this.log({
+                level: "error",
+                action: "sync",
+                message,
+                domain: record.domain,
+                type: record.type,
+                nodeUuid: record.nodeUuid
+              });
+              if (error instanceof CloudflareError && error.status === 429) {
+                this.blockedUntil = Date.now() + (error.retryAfterMs || 6e4);
+                rateLimited = true;
+                this.job.completed += 1;
+                break;
+              }
             }
-            this.statuses[record.id] = statusForRecord(record, "error", {
-              action: "error",
-              lastError: message
-            });
-            this.job.errors += 1;
-            if (previousStatus?.state !== "error") {
-              this.failures.push({
+            if (result?.changed && (result.action === "created" || result.action === "updated" && result.previousIp !== result.currentIp)) {
+              this.changes.push({
                 record,
                 nodeName: nodeMap.get(record.nodeUuid)?.name || record.nodeUuid,
-                message
+                previousIp: result.previousIp,
+                currentIp: result.currentIp || "",
+                action: result.action
               });
             }
-            this.deps.storage.appendLog({
-              level: "error",
-              action: "sync",
-              message,
-              domain: record.domain,
-              type: record.type,
-              nodeUuid: record.nodeUuid
-            });
+            this.job.completed += 1;
           }
-          if (result?.changed && (result.action === "created" || result.action === "updated") && (result.action === "created" || result.previousIp !== result.currentIp)) {
-            this.changes.push({
-              record,
-              nodeName: nodeMap.get(record.nodeUuid)?.name || record.nodeUuid,
-              previousIp: result.previousIp,
-              currentIp: result.currentIp || "",
-              action: result.action
-            });
-          }
-          this.job.completed += 1;
+          this.persistStatuses();
+          await new Promise((resolve) => setTimeout(resolve, 0));
         }
-        this.deps.storage.saveStatuses(this.statuses);
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-      this.job.running = false;
-      this.job.finishedAt = nowIso();
-      this.job.message = `\u540C\u6B65\u5B8C\u6210\uFF1A\u5171 ${this.job.total} \u6761\uFF0C\u53D8\u66F4 ${this.job.changed} \u6761\uFF0C\u8DF3\u8FC7 ${this.job.skipped} \u6761\uFF0C\u5931\u8D25 ${this.job.errors} \u6761\u3002`;
-      if (this.job.changed > 0 || this.job.errors > 0) {
-        this.deps.storage.appendLog({
-          level: this.job.errors ? "warning" : "success",
-          action: "sync",
-          message: this.job.message
-        });
+      } finally {
+        this.job.running = false;
+        this.job.finishedAt = nowIso();
+        const blockedNote = rateLimited ? "\uFF1B\u89E6\u53D1 Cloudflare \u9650\u6D41\uFF0C\u672C\u8F6E\u63D0\u524D\u7ED3\u675F" : "";
+        this.job.message = `\u540C\u6B65\u7ED3\u675F\uFF1A\u672C\u8F6E\u5904\u7406 ${this.job.completed}/${this.job.total} \u6761\uFF0C\u53D8\u66F4 ${this.job.changed} \u6761\uFF0C\u8DF3\u8FC7 ${this.job.skipped} \u6761\uFF0C\u5931\u8D25 ${this.job.errors} \u6761${blockedNote}\u3002`;
+        if (this.job.changed > 0 || this.job.errors > 0 || rateLimited) {
+          this.log({
+            level: rateLimited || this.job.errors ? "warning" : "success",
+            action: "sync",
+            message: this.job.message
+          });
+        }
+        try {
+          this.persistStatuses();
+        } catch {
+        }
+        this.deps.storage.flushLogs();
       }
       await this.sendNotificationSummary(settings);
     }
@@ -1211,14 +1282,15 @@
           clients
         });
       } catch (error) {
-        this.deps.storage.appendLog({
+        this.log({
           level: "warning",
           action: "notify",
           message: `\u901A\u77E5\u53D1\u9001\u5931\u8D25\uFF1A${redact(errorMessage(error), settings)}`
         });
+        this.deps.storage.flushLogs();
       }
     }
-    async syncRecord(record, client, nodes, compareMode, forceCloudflare) {
+    async syncRecord(record, client, nodes, settings, forceCloudflare) {
       if (!record.enabled) {
         this.statuses[record.id] = statusForRecord(record, "disabled", {
           action: "skipped"
@@ -1230,26 +1302,33 @@
       if (!node) {
         throw new PluginError("\u6240\u9009\u8282\u70B9\u5DF2\u5220\u9664\u6216\u65E0\u6CD5\u8BFB\u53D6\u3002", 422);
       }
+      const previous = this.statuses[record.id];
       if (!node.online) {
         this.statuses[record.id] = statusForRecord(record, "skipped", {
           action: "skipped",
-          lastError: "\u8282\u70B9\u79BB\u7EBF\uFF0C\u4FDD\u7559\u73B0\u6709 DNS \u8BB0\u5F55\u3002"
+          currentIp: previous?.currentIp,
+          recordId: previous?.recordId,
+          lastError: "\u8282\u70B9\u79BB\u7EBF\uFF0C\u4FDD\u7559\u73B0\u6709 DNS \u8BB0\u5F55\u3002",
+          lastReconciledAt: previous?.lastReconciledAt
         });
         this.job.skipped += 1;
-        this.deps.storage.appendLog({
-          level: "info",
-          action: "sync",
-          message: "\u8282\u70B9\u79BB\u7EBF\uFF0C\u8DF3\u8FC7\u540C\u6B65\u3002",
-          domain: record.domain,
-          type: record.type,
-          nodeUuid: record.nodeUuid
-        });
+        if (previous?.state !== "skipped") {
+          this.log({
+            level: "info",
+            action: "sync",
+            message: "\u8282\u70B9\u79BB\u7EBF\uFF0C\u8DF3\u8FC7\u540C\u6B65\u3002",
+            domain: record.domain,
+            type: record.type,
+            nodeUuid: record.nodeUuid
+          });
+        }
         return { changed: false, action: "skipped" };
       }
       const ip = validateAddress(record.type === "A" ? node.ipv4 : node.ipv6, record.type);
       const effectiveTtl = record.proxied ? 1 : record.ttl;
-      const previous = this.statuses[record.id];
-      if (!forceCloudflare && compareMode === "local" && previous?.state === "success" && previous.currentIp === ip && previous.recordId && previous.syncedTtl === effectiveTtl && previous.syncedProxied === record.proxied) {
+      const reconcile = needsReconcile(previous, settings.reconcileHours, record.id);
+      const canSkipCloudflare = !forceCloudflare && !reconcile && settings.compareMode === "local" && previous?.state === "success" && previous.currentIp === ip && previous.recordId && previous.syncedTtl === effectiveTtl && previous.syncedProxied === record.proxied;
+      if (canSkipCloudflare) {
         this.statuses[record.id] = statusForRecord(record, "success", {
           action: "unchanged",
           currentIp: ip,
@@ -1257,7 +1336,8 @@
           lastSuccessAt: previous.lastSuccessAt,
           lastChangedAt: previous.lastChangedAt,
           syncedTtl: effectiveTtl,
-          syncedProxied: record.proxied
+          syncedProxied: record.proxied,
+          lastReconciledAt: previous.lastReconciledAt
         });
         this.job.skipped += 1;
         return { changed: false, action: "unchanged", previousIp: ip, currentIp: ip };
@@ -1272,8 +1352,8 @@
         throw new PluginError("\u53D1\u73B0\u591A\u6761\u7531\u672C\u63D2\u4EF6\u7BA1\u7406\u7684\u91CD\u590D DNS \u8BB0\u5F55\uFF0C\u8BF7\u5148\u5230 Cloudflare \u6574\u7406\u3002", 422);
       }
       let current = managed[0];
-      if (!current && this.statuses[record.id]?.recordId) {
-        current = existing.find((item) => item.id === this.statuses[record.id]?.recordId);
+      if (!current && previous?.recordId) {
+        current = existing.find((item) => item.id === previous.recordId);
       }
       if (!current) {
         const orphanedManaged = existing.filter(
@@ -1290,7 +1370,7 @@
       if (!current) {
         const unmanaged = existing.filter((item) => !String(item.comment || "").startsWith("komari-ddns-plus:"));
         if (unmanaged.length > 0) {
-          if (!record.adoptExisting || unmanaged.length !== 1 || unmanaged[0].comment) {
+          if (!record.adoptExisting || unmanaged.length !== 1) {
             throw new PluginError(
               "\u76EE\u6807\u57DF\u540D\u5DF2\u6709\u975E\u672C\u63D2\u4EF6\u7BA1\u7406\u7684\u540C\u7C7B\u578B\u8BB0\u5F55\uFF0C\u5DF2\u505C\u6B62\u8986\u76D6\u3002\u53EF\u5148\u6574\u7406\u8BB0\u5F55\uFF0C\u6216\u542F\u7528\u201C\u63A5\u7BA1\u552F\u4E00\u5DF2\u6709\u8BB0\u5F55\u201D\u3002",
               422
@@ -1308,14 +1388,16 @@
         comment: marker
       };
       if (current && current.content === ip && Number(current.ttl) === payload.ttl && Boolean(current.proxied) === payload.proxied && current.comment === marker) {
+        const reconciledAt = nowIso();
         this.statuses[record.id] = statusForRecord(record, "success", {
           action: "unchanged",
           currentIp: ip,
           recordId: current.id,
-          lastSuccessAt: nowIso(),
-          lastChangedAt: this.statuses[record.id]?.lastChangedAt,
+          lastSuccessAt: reconciledAt,
+          lastChangedAt: previous?.lastChangedAt,
           syncedTtl: payload.ttl,
-          syncedProxied: record.proxied
+          syncedProxied: record.proxied,
+          lastReconciledAt: reconciledAt
         });
         this.job.skipped += 1;
         return {
@@ -1334,10 +1416,11 @@
         lastSuccessAt: changedAt,
         lastChangedAt: changedAt,
         syncedTtl: payload.ttl,
-        syncedProxied: record.proxied
+        syncedProxied: record.proxied,
+        lastReconciledAt: changedAt
       });
       this.job.changed += 1;
-      this.deps.storage.appendLog({
+      this.log({
         level: "success",
         action: current ? "update" : "create",
         message: `${current ? "\u66F4\u65B0" : "\u521B\u5EFA"} ${record.type} \u8BB0\u5F55\u4E3A ${ip}`,
@@ -1355,6 +1438,7 @@
   };
 
   // src/routes.ts
+  var import_node_crypto2 = __toESM(__require("node:crypto"));
   var import_plugin_sdk = __toESM(require_src());
 
   // src/batch.ts
@@ -1455,8 +1539,8 @@
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("X-Content-Type-Options", "nosniff");
   }
-  function fail(res, error) {
-    const message = errorMessage(error);
+  function fail(res, error, storage2) {
+    const message = redact(errorMessage(error), storage2.loadSettings());
     const status = error instanceof PluginError ? error.status : 500;
     setNoStore(res);
     (0, import_plugin_sdk.jsonResponse)(res, { error: message }, status);
@@ -1470,7 +1554,11 @@
   function requireCsrf(req, expected) {
     const value = req.headers["x-komari-ddns-plus-csrf"];
     const token = Array.isArray(value) ? value[0] : value;
-    if (!token || token !== expected) throw new PluginError("CSRF \u6821\u9A8C\u5931\u8D25\uFF0C\u8BF7\u5237\u65B0\u9875\u9762\u540E\u91CD\u8BD5\u3002", 403);
+    if (!token) throw new PluginError("CSRF \u6821\u9A8C\u5931\u8D25\uFF0C\u8BF7\u5237\u65B0\u9875\u9762\u540E\u91CD\u8BD5\u3002", 403);
+    const left = Buffer.from(String(token));
+    const right = Buffer.from(expected);
+    const same = left.length === right.length && import_node_crypto2.default.timingSafeEqual(left, right);
+    if (!same) throw new PluginError("CSRF \u6821\u9A8C\u5931\u8D25\uFF0C\u8BF7\u5237\u65B0\u9875\u9762\u540E\u91CD\u8BD5\u3002", 403);
   }
   function bodyOf(req) {
     const parsed = parseJsonBody(req.body);
@@ -1518,7 +1606,7 @@
         statuses: snapshot.statuses,
         sync: snapshot.job,
         csrf: csrf2,
-        version: "0.0.4"
+        version: "0.0.5"
       });
     });
     server2.route("GET", "/ddns-plus/nodes", async (req, res) => {
@@ -1527,7 +1615,7 @@
         setNoStore(res);
         (0, import_plugin_sdk.jsonResponse)(res, await getNodes2());
       } catch (error) {
-        fail(res, error);
+        fail(res, error, storage2);
       }
     });
     server2.route("POST", "/ddns-plus/settings/test", async (req, res) => {
@@ -1540,7 +1628,7 @@
         setNoStore(res);
         (0, import_plugin_sdk.jsonResponse)(res, result);
       } catch (error) {
-        fail(res, error);
+        fail(res, error, storage2);
       }
     });
     server2.route("POST", "/ddns-plus/settings", (req, res) => {
@@ -1559,13 +1647,14 @@
         setNoStore(res);
         (0, import_plugin_sdk.jsonResponse)(res, { settings: publicSettings(next) });
       } catch (error) {
-        fail(res, error);
+        fail(res, error, storage2);
       }
     });
     server2.route("POST", "/ddns-plus/pause", (req, res) => {
       if (!requireAdmin(req, res)) return;
       try {
         requireCsrf(req, csrf2);
+        ensureIdle(engine2);
         const paused = parseBoolean(bodyOf(req).paused, false, "\u6682\u505C\u5F00\u5173");
         const settings = storage2.loadSettings();
         settings.paused = paused;
@@ -1579,7 +1668,7 @@
         setNoStore(res);
         (0, import_plugin_sdk.jsonResponse)(res, { paused });
       } catch (error) {
-        fail(res, error);
+        fail(res, error, storage2);
       }
     });
     server2.route("POST", "/ddns-plus/records/batch", async (req, res) => {
@@ -1648,7 +1737,7 @@
           records: generated
         });
       } catch (error) {
-        fail(res, error);
+        fail(res, error, storage2);
       }
     });
     server2.route("POST", "/ddns-plus/groups/update", (req, res) => {
@@ -1722,6 +1811,7 @@
         const nextIds = new Set(nextGroupRecords.map((record) => record.id));
         const removedIds = groupItems.filter((record) => !nextIds.has(record.id)).map((record) => record.id);
         const nextRecords = records.filter((record) => record.groupId !== groupId).concat(nextGroupRecords);
+        assertRecordLimit(nextRecords.length);
         storage2.saveRecords(nextRecords);
         if (removedIds.length) engine2.removeStatuses(removedIds);
         storage2.appendLog({
@@ -1736,7 +1826,7 @@
           removedTargets: removedIds.length
         });
       } catch (error) {
-        fail(res, error);
+        fail(res, error, storage2);
       }
     });
     server2.route("POST", "/ddns-plus/records/bulk", (req, res) => {
@@ -1789,7 +1879,7 @@
         }
         throw new PluginError("\u4E0D\u652F\u6301\u7684\u6279\u91CF\u64CD\u4F5C\u3002");
       } catch (error) {
-        fail(res, error);
+        fail(res, error, storage2);
       }
     });
     server2.route("POST", "/ddns-plus/sync", (req, res) => {
@@ -1808,7 +1898,7 @@
         setNoStore(res);
         (0, import_plugin_sdk.jsonResponse)(res, { ok: true, job });
       } catch (error) {
-        fail(res, error);
+        fail(res, error, storage2);
       }
     });
     server2.route("GET", "/ddns-plus/logs", (req, res) => {
@@ -1817,9 +1907,10 @@
       const level = String(query.level || "");
       const domain = String(query.domain || "").toLowerCase();
       const limit = Math.max(1, Math.min(1e3, Number(query.limit) || 200));
-      const logs = storage2.loadLogs().filter((log) => (!level || log.level === level) && (!domain || String(log.domain || "").toLowerCase().includes(domain))).slice(-limit).reverse();
+      const matched = storage2.loadLogs().filter((log) => (!level || log.level === level) && (!domain || String(log.domain || "").toLowerCase().includes(domain)));
+      const logs = matched.slice(-limit).reverse();
       setNoStore(res);
-      (0, import_plugin_sdk.jsonResponse)(res, { logs, total: logs.length });
+      (0, import_plugin_sdk.jsonResponse)(res, { logs, total: matched.length, limit });
     });
     server2.route("DELETE", "/ddns-plus/logs", (req, res) => {
       if (!requireAdmin(req, res)) return;
@@ -1829,7 +1920,7 @@
         setNoStore(res);
         (0, import_plugin_sdk.jsonResponse)(res, { ok: true });
       } catch (error) {
-        fail(res, error);
+        fail(res, error, storage2);
       }
     });
   }
@@ -1847,10 +1938,15 @@
     paused: false,
     compareMode: "local",
     intervalMinutes: 1,
+    reconcileHours: RECONCILE_DEFAULT_HOURS,
     updatedAt: ""
   };
+  var LOG_FLUSH_DELAY_MS = 100;
   var Storage = class {
     constructor(baseDir) {
+      this.logCache = null;
+      this.logTimer = null;
+      this.issues = [];
       this.baseDir = baseDir;
     }
     ensure() {
@@ -1859,22 +1955,64 @@
     file(name) {
       return path.join(this.baseDir, name);
     }
+    /**
+     * 读取 JSON 文件。解析失败时把原文件另存为 <name>.corrupt-<ts> 备份，
+     * 避免后续保存把用户数据静默覆盖成默认值。
+     */
     readJson(name, fallback) {
       const file = this.file(name);
       if (!fs.existsSync(file)) return fallback;
+      let text;
       try {
-        return JSON.parse(fs.readFileSync(file, "utf8"));
+        text = fs.readFileSync(file, "utf8");
       } catch (error) {
-        console.error(`[ddns-plus] failed to read ${name}:`, error);
+        this.recordIssue(name, "\u8BFB\u53D6\u5931\u8D25", error);
         return fallback;
       }
+      if (!text.trim()) return fallback;
+      try {
+        return JSON.parse(text);
+      } catch (error) {
+        this.recordIssue(name, "\u5185\u5BB9\u635F\u574F", error, text);
+        return fallback;
+      }
+    }
+    recordIssue(name, reason, error, content) {
+      const detail = error instanceof Error ? error.message : String(error);
+      let backupNote = "";
+      if (content !== void 0) {
+        try {
+          const backup = this.file(`${name}.corrupt-${Date.now()}`);
+          fs.writeFileSync(backup, content, { encoding: "utf8", mode: 384 });
+          backupNote = `\uFF0C\u539F\u6587\u4EF6\u5DF2\u5907\u4EFD\u4E3A ${path.basename(backup)}`;
+        } catch {
+          backupNote = "\uFF0C\u5907\u4EFD\u5931\u8D25";
+        }
+      }
+      const message = `${name} ${reason}\uFF1A${detail}${backupNote}`;
+      this.issues.push(message);
+      console.error(`[ddns-plus] ${message}`);
+    }
+    /** 取出并清空本次进程内记录到的存储异常，供上层写日志。 */
+    drainIssues() {
+      if (!this.issues.length) return [];
+      const pending = this.issues;
+      this.issues = [];
+      return pending;
     }
     writeJson(name, value, privateFile = false) {
       this.ensure();
       const target = this.file(name);
       const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
       const serialized = JSON.stringify(value, null, 2);
-      fs.writeFileSync(temp, serialized, { encoding: "utf8", mode: privateFile ? 384 : 420 });
+      const mode = privateFile ? 384 : 420;
+      const handle = fs.openSync(temp, "w", mode);
+      try {
+        fs.writeFileSync(handle, serialized, { encoding: "utf8" });
+        fs.fsyncSync(handle);
+      } finally {
+        fs.closeSync(handle);
+      }
       fs.renameSync(temp, target);
       if (privateFile) {
         try {
@@ -1882,9 +2020,19 @@
         } catch {
         }
       }
+      try {
+        const dirHandle = fs.openSync(this.baseDir, "r");
+        try {
+          fs.fsyncSync(dirHandle);
+        } finally {
+          fs.closeSync(dirHandle);
+        }
+      } catch {
+      }
     }
     loadSettings() {
       const raw = this.readJson("settings.json", {});
+      const reconcile = Number(raw.reconcileHours);
       return {
         ...DEFAULT_SETTINGS,
         ...raw,
@@ -1897,6 +2045,7 @@
         paused: Boolean(raw.paused),
         compareMode: raw.compareMode === "cloudflare" ? "cloudflare" : "local",
         intervalMinutes: Number(raw.intervalMinutes) || 1,
+        reconcileHours: Number.isFinite(reconcile) && reconcile >= 0 && reconcile <= RECONCILE_MAX_HOURS ? reconcile : RECONCILE_DEFAULT_HOURS,
         updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : ""
       };
     }
@@ -1939,20 +2088,47 @@
     saveStatuses(statuses) {
       this.writeJson("status.json", statuses, true);
     }
+    logs() {
+      if (this.logCache === null) {
+        const raw = this.readJson("logs.json", []);
+        this.logCache = Array.isArray(raw) ? raw : [];
+      }
+      return this.logCache;
+    }
     loadLogs() {
-      const raw = this.readJson("logs.json", []);
-      return Array.isArray(raw) ? raw : [];
+      return this.logs().slice();
     }
     appendLog(entry) {
-      const logs = this.loadLogs();
+      const logs = this.logs();
       logs.push({
         ...entry,
         id: entry.id || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
         at: entry.at || nowIso()
       });
-      this.writeJson("logs.json", logs.slice(-MAX_LOGS));
+      if (logs.length > MAX_LOGS) logs.splice(0, logs.length - MAX_LOGS);
+      if (this.logTimer) return;
+      this.logTimer = setTimeout(() => {
+        this.logTimer = null;
+        this.flushLogs();
+      }, LOG_FLUSH_DELAY_MS);
+      const timer = this.logTimer;
+      if (typeof timer.unref === "function") timer.unref();
+    }
+    /** 立即把内存中的日志写入磁盘（批量写入前的合并点）。 */
+    flushLogs() {
+      if (this.logTimer) {
+        clearTimeout(this.logTimer);
+        this.logTimer = null;
+      }
+      if (this.logCache === null) return;
+      this.writeJson("logs.json", this.logCache);
     }
     clearLogs() {
+      if (this.logTimer) {
+        clearTimeout(this.logTimer);
+        this.logTimer = null;
+      }
+      this.logCache = [];
       this.writeJson("logs.json", []);
     }
   };
@@ -1971,12 +2147,15 @@
     return [];
   }
   function nodeOnline(status) {
-    if (!status) return true;
+    if (status === void 0 || status === null) return false;
     if (typeof status === "boolean") return status;
-    if (typeof status === "object" && "online" in status) {
-      return status.online !== false;
+    if (typeof status === "object") {
+      const online = status.online;
+      if (typeof online === "boolean") return online;
+      const connected = status.connected;
+      if (typeof connected === "boolean") return connected;
     }
-    return true;
+    return false;
   }
   async function getNodes(uuids) {
     const raw = await import_plugin_sdk2.server.call("common:getNodes");
@@ -1987,6 +2166,7 @@
     });
     const selected = list.map((node) => String(node.uuid || "")).filter(Boolean);
     let statuses = {};
+    let statusError = "";
     try {
       const result = await import_plugin_sdk2.server.call(
         "common:getNodesLatestStatus",
@@ -1994,16 +2174,27 @@
       );
       statuses = result && typeof result === "object" ? result : {};
     } catch (error) {
-      console.warn("[ddns-plus] getNodesLatestStatus failed:", errorMessage(error));
+      statusError = errorMessage(error);
+      console.warn("[ddns-plus] getNodesLatestStatus failed:", statusError);
+    }
+    if (statusError) {
+      const settings = storage.loadSettings();
+      storage.appendLog({
+        level: "warning",
+        action: "sync",
+        message: `\u65E0\u6CD5\u8BFB\u53D6\u8282\u70B9\u5728\u7EBF\u72B6\u6001\uFF0C\u672C\u8F6E\u5168\u90E8\u8DF3\u8FC7\uFF1A${redact(statusError, settings)}`
+      });
+      storage.flushLogs();
     }
     return list.map((node) => {
       const uuid = String(node.uuid || "");
+      const status = statuses[uuid];
       return {
         uuid,
         name: String(node.name || uuid),
         ipv4: String(node.ipv4 || ""),
         ipv6: String(node.ipv6 || ""),
-        online: nodeOnline(statuses[uuid]),
+        online: statusError ? false : nodeOnline(status),
         group: String(node.group || "")
       };
     }).filter((node) => node.uuid).sort((left, right) => left.name.localeCompare(right.name));
@@ -2018,9 +2209,23 @@
       }
     });
   }
+  function reportStorageIssues() {
+    const issues = storage.drainIssues();
+    if (!issues.length) return;
+    const settings = storage.loadSettings();
+    for (const issue of issues) {
+      storage.appendLog({
+        level: "error",
+        action: "storage",
+        message: `\u6570\u636E\u6587\u4EF6\u5F02\u5E38\uFF1A${redact(issue, settings)}`
+      });
+    }
+    storage.flushLogs();
+  }
   (0, import_plugin_sdk2.definePlugin)({
     load() {
       storage.ensure();
+      reportStorageIssues();
       csrf = makeId(24);
       engine = new SyncEngine({ storage, getNodes, notify });
       registerRoutes({ server: import_plugin_sdk2.server, storage, engine, getNodes, csrf });
@@ -2034,11 +2239,17 @@
             action: "schedule",
             message: redact(errorMessage(error), settings)
           });
+          storage.flushLogs();
         }
       });
       console.log("[ddns-plus] loaded, storage:", __storageDir__);
     },
     unload() {
+      try {
+        storage.flushLogs();
+      } catch (error) {
+        console.warn("[ddns-plus] flush logs on unload failed:", errorMessage(error));
+      }
       console.log("[ddns-plus] unloaded");
     }
   });

@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type { PluginRequest, PluginResponse, PluginServer } from "@komari-monitor/plugin-sdk";
 import { jsonResponse } from "@komari-monitor/plugin-sdk";
 import { expandBatch } from "./batch";
@@ -20,6 +21,7 @@ import {
   parseJsonBody,
   publicSettings,
   recordKey,
+  redact,
   resolveCredentials,
 } from "./util";
 
@@ -45,8 +47,8 @@ function setNoStore(res: PluginResponse): void {
   res.setHeader("X-Content-Type-Options", "nosniff");
 }
 
-function fail(res: PluginResponse, error: unknown): void {
-  const message = errorMessage(error);
+function fail(res: PluginResponse, error: unknown, storage: Storage): void {
+  const message = redact(errorMessage(error), storage.loadSettings());
   const status = error instanceof PluginError ? error.status : 500;
   setNoStore(res);
   jsonResponse(res, { error: message }, status);
@@ -62,7 +64,11 @@ function requireAdmin(req: PluginRequest, res: PluginResponse): boolean {
 function requireCsrf(req: PluginRequest, expected: string): void {
   const value = req.headers["x-komari-ddns-plus-csrf"];
   const token = Array.isArray(value) ? value[0] : value;
-  if (!token || token !== expected) throw new PluginError("CSRF 校验失败，请刷新页面后重试。", 403);
+  if (!token) throw new PluginError("CSRF 校验失败，请刷新页面后重试。", 403);
+  const left = Buffer.from(String(token));
+  const right = Buffer.from(expected);
+  const same = left.length === right.length && crypto.timingSafeEqual(left, right);
+  if (!same) throw new PluginError("CSRF 校验失败，请刷新页面后重试。", 403);
 }
 
 function bodyOf(req: PluginRequest): Record<string, unknown> {
@@ -119,7 +125,7 @@ export function registerRoutes(deps: RouteDependencies): void {
       statuses: snapshot.statuses,
       sync: snapshot.job,
       csrf,
-      version: "0.0.4",
+      version: "0.0.5",
     });
   });
 
@@ -129,7 +135,7 @@ export function registerRoutes(deps: RouteDependencies): void {
       setNoStore(res);
       jsonResponse(res, await getNodes());
     } catch (error) {
-      fail(res, error);
+      fail(res, error, storage);
     }
   });
 
@@ -143,7 +149,7 @@ export function registerRoutes(deps: RouteDependencies): void {
       setNoStore(res);
       jsonResponse(res, result);
     } catch (error) {
-      fail(res, error);
+      fail(res, error, storage);
     }
   });
 
@@ -163,7 +169,7 @@ export function registerRoutes(deps: RouteDependencies): void {
       setNoStore(res);
       jsonResponse(res, { settings: publicSettings(next) });
     } catch (error) {
-      fail(res, error);
+      fail(res, error, storage);
     }
   });
 
@@ -171,6 +177,7 @@ export function registerRoutes(deps: RouteDependencies): void {
     if (!requireAdmin(req, res)) return;
     try {
       requireCsrf(req, csrf);
+      ensureIdle(engine);
       const paused = parseBoolean(bodyOf(req).paused, false, "暂停开关");
       const settings = storage.loadSettings();
       settings.paused = paused;
@@ -184,7 +191,7 @@ export function registerRoutes(deps: RouteDependencies): void {
       setNoStore(res);
       jsonResponse(res, { paused });
     } catch (error) {
-      fail(res, error);
+      fail(res, error, storage);
     }
   });
 
@@ -257,7 +264,7 @@ export function registerRoutes(deps: RouteDependencies): void {
         records: generated,
       });
     } catch (error) {
-      fail(res, error);
+      fail(res, error, storage);
     }
   });
 
@@ -346,6 +353,7 @@ export function registerRoutes(deps: RouteDependencies): void {
       const nextRecords = records
         .filter((record) => record.groupId !== groupId)
         .concat(nextGroupRecords);
+      assertRecordLimit(nextRecords.length);
       storage.saveRecords(nextRecords);
       if (removedIds.length) engine.removeStatuses(removedIds);
       storage.appendLog({
@@ -362,7 +370,7 @@ export function registerRoutes(deps: RouteDependencies): void {
         removedTargets: removedIds.length,
       });
     } catch (error) {
-      fail(res, error);
+      fail(res, error, storage);
     }
   });
 
@@ -416,7 +424,7 @@ export function registerRoutes(deps: RouteDependencies): void {
       }
       throw new PluginError("不支持的批量操作。");
     } catch (error) {
-      fail(res, error);
+      fail(res, error, storage);
     }
   });
 
@@ -442,7 +450,7 @@ export function registerRoutes(deps: RouteDependencies): void {
       setNoStore(res);
       jsonResponse(res, { ok: true, job });
     } catch (error) {
-      fail(res, error);
+      fail(res, error, storage);
     }
   });
 
@@ -452,13 +460,12 @@ export function registerRoutes(deps: RouteDependencies): void {
     const level = String(query.level || "");
     const domain = String(query.domain || "").toLowerCase();
     const limit = Math.max(1, Math.min(1000, Number(query.limit) || 200));
-    const logs = storage
+    const matched = storage
       .loadLogs()
-      .filter((log) => (!level || log.level === level) && (!domain || String(log.domain || "").toLowerCase().includes(domain)))
-      .slice(-limit)
-      .reverse();
+      .filter((log) => (!level || log.level === level) && (!domain || String(log.domain || "").toLowerCase().includes(domain)));
+    const logs = matched.slice(-limit).reverse();
     setNoStore(res);
-    jsonResponse(res, { logs, total: logs.length });
+    jsonResponse(res, { logs, total: matched.length, limit });
   });
 
   server.route("DELETE", "/ddns-plus/logs", (req, res) => {
@@ -469,7 +476,7 @@ export function registerRoutes(deps: RouteDependencies): void {
       setNoStore(res);
       jsonResponse(res, { ok: true });
     } catch (error) {
-      fail(res, error);
+      fail(res, error, storage);
     }
   });
 }

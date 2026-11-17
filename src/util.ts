@@ -9,6 +9,9 @@ import {
   MAX_NODES_PER_BATCH,
   MAX_RECORDS,
   PublicSettings,
+  RECONCILE_DEFAULT_HOURS,
+  RECONCILE_MAX_HOURS,
+  RecordStatus,
   Settings,
   TTL_VALUES,
 } from "./types";
@@ -167,6 +170,10 @@ export function normalizeSettings(input: unknown, previous?: Settings): Settings
   if (raw.paused !== undefined && typeof raw.paused !== "boolean") {
     throw new PluginError("暂停开关格式无效。");
   }
+  const reconcileHours = normalizeReconcileHours(
+    raw.reconcileHours,
+    previous?.reconcileHours ?? RECONCILE_DEFAULT_HOURS,
+  );
 
   return {
     version: 1,
@@ -178,6 +185,7 @@ export function normalizeSettings(input: unknown, previous?: Settings): Settings
     paused: raw.paused === undefined ? Boolean(previous?.paused) : Boolean(raw.paused),
     compareMode,
     intervalMinutes,
+    reconcileHours,
     updatedAt: nowIso(),
   };
 }
@@ -218,8 +226,44 @@ export function publicSettings(settings: Settings): PublicSettings {
     paused: settings.paused,
     compareMode: settings.compareMode,
     intervalMinutes: settings.intervalMinutes,
+    reconcileHours: settings.reconcileHours,
     updatedAt: settings.updatedAt,
   };
+}
+
+/**
+ * 定期强制同步（对账）间隔，单位为小时。
+ * 0 表示关闭对账；允许小数，方便把对账压到需要的精度。
+ */
+export function normalizeReconcileHours(value: unknown, fallback: number): number {
+  if (value === undefined || value === null || value === "") return fallback;
+  const hours = Number(value);
+  if (!Number.isFinite(hours) || hours < 0 || hours > RECONCILE_MAX_HOURS) {
+    throw new PluginError(`定期强制同步间隔必须是 0 到 ${RECONCILE_MAX_HOURS} 之间的小时数。`);
+  }
+  if (hours > 0 && hours < 1 / 60) {
+    throw new PluginError("定期强制同步间隔不能小于 1 分钟；如需停止对账请填 0。");
+  }
+  return Math.round(hours * 60) / 60;
+}
+
+/**
+ * 判断某条规则本轮是否需要去 Cloudflare 对账。
+ * 按 recordId 做 ±10% 的窗口抖动，避免上千条规则在同一时刻集中请求 Cloudflare。
+ */
+export function needsReconcile(
+  status: RecordStatus | undefined,
+  hours: number,
+  recordId: string,
+  now: number = Date.now(),
+): boolean {
+  if (!Number.isFinite(hours) || hours <= 0) return false;
+  const last = status?.lastReconciledAt ? Date.parse(status.lastReconciledAt) : NaN;
+  if (!Number.isFinite(last)) return true;
+  const hash = [...recordId].reduce((acc, char) => (acc * 31 + char.charCodeAt(0)) >>> 0, 0);
+  const jitter = (hash % 200) / 1000 - 0.1;
+  const windowMs = hours * 3600000 * (1 + jitter);
+  return now - last >= windowMs;
 }
 
 export function normalizeTtl(value: unknown, proxied: boolean): number {
